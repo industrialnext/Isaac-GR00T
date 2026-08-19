@@ -2,17 +2,17 @@
 
 **Date:** 2026-08-19
 
-**Status:** Implementation-ready
+**Status:** Implemented and validated
 
 **Design:**
 [`2026_0819_zdata_pipeline_generalization_design.md`](2026_0819_zdata_pipeline_generalization_design.md)
 
 ## Motivation
 
-The current semihumanoid path is proven end to end, but its layout and workflow are split
-across an 813-line converter, a dataset-list helper, a generated-looking but hand-maintained
-modality module, and a shell training launcher. Adding another zdata_hdf5 embodiment would
-require copying and editing those files.
+The pre-cutover semihumanoid path was proven end to end, but its layout and workflow were
+split across an 813-line converter, a dataset-list helper, a generated-looking but
+hand-maintained modality module, and a shell training launcher. Adding another zdata_hdf5
+embodiment would have required copying and editing those files.
 
 The target is one small YAML per embodiment and two routine commands:
 
@@ -79,6 +79,7 @@ not a new abstraction.
 |---|---|---|
 | `scripts/lerobot_conversion/run_zdata_pipeline.py` | Add | Thin `argparse` CLI for `sync`, `stats`, `check`, and `train`; lazy-load HDF5 code |
 | `scripts/lerobot_conversion/zdata_pipeline/__init__.py` | Add | Declare the shared helper package without importing optional HDF5 dependencies |
+| `scripts/lerobot_conversion/zdata_pipeline/common.py` | Add | HDF5-free stats filenames and incomplete-transaction guard shared by output-only commands |
 | `scripts/lerobot_conversion/zdata_pipeline/config.py` | Add | Safe YAML parsing, dataclasses, layout derivation, modality/layout artifact rendering |
 | `scripts/lerobot_conversion/zdata_pipeline/source.py` | Add | zdata_hdf5 discovery/read, named-field extraction, rot6d conversion, selection/warnings, optional gap segmentation |
 | `scripts/lerobot_conversion/zdata_pipeline/convert.py` | Add | Staging, append ledger, task/index assignment, parquet/MP4 commit, LeRobot metadata, stats invalidation |
@@ -94,7 +95,10 @@ not a new abstraction.
 Keep `survey_zdata_source.py` and `camera_health_zdata.py` as optional, standalone source
 diagnostics. They do not become required pipeline stages.
 
-## Existing code to reuse
+## Pre-cutover code reused
+
+The source paths in this section identify the baseline implementation used during the work;
+the files marked for removal above no longer exist after the completed cutover.
 
 - `scripts/lerobot_conversion/convert_semihumanoid.py:163-230` — move the proven rot6d
   conversion and name-based field assembly into `source.py`, replacing constants with parsed
@@ -147,7 +151,9 @@ diagnostics. They do not become required pipeline stages.
 - Require one unambiguous 6D rotation field for any entry declaring
   `source_columns_to_groot_rows`; require 9 total dimensions for `EEF/XYZ_ROT6D` actions.
 - Render `meta/modality.json`, the generated Python module, and per-dataset `_layout.json`
-  from the same normalized layout object. `_layout.json` stores direct values, not a hash.
+  from the same normalized layout object. `_layout.json` stores direct fields, transforms,
+  action representation values, camera mapping, sampling/image values, robot/chunk values,
+  and declared video format—not a hash.
 - Write generated text/JSON only when bytes differ, using temporary sibling files plus
   `os.replace`.
 - `sync --dry-run` performs discovery, parsing, compatibility comparison, and planning in
@@ -207,9 +213,10 @@ at a time.
 
 Before the first final replacement for a dataset, atomically write a transient
 `<dataset>/.sync_transaction.json` recovery journal containing the transaction staging
-directory, the ordered staging-to-final replacements, the resulting ledger records, and the
-two stats paths to invalidate. Then apply each `os.replace`, replace the ledger and metadata,
-remove stale stats, and delete the journal and transaction staging directory. On startup,
+directory, the ordered staging-to-final replacements (including the staged ledger), worker-
+stage cleanup paths, and the two stats paths to invalidate. Then apply each `os.replace`,
+replace the ledger and metadata, remove stale stats/consumed staging, and delete the journal
+and transaction staging directory. On startup,
 `sync` acquires the lock and rolls any journal forward idempotently: a remaining staging path
 is replaced, while a missing staging path is accepted only when its final target exists.
 `stats`, `check`, and `train` stop only while a journal exists because they must not observe a
@@ -321,7 +328,7 @@ episode rows or task mappings.
 
 ### Phase 1 — Configuration and layout generation
 
-- [ ] **1.1** Add the package skeleton and CLI subcommands
+- [x] **1.1** Add the package skeleton and CLI subcommands
   (`scripts/lerobot_conversion/run_zdata_pipeline.py`,
   `scripts/lerobot_conversion/zdata_pipeline/__init__.py`, and helper modules).
   - Keep top-level imports HDF5-free so `train`, `stats`, and output-only `check` work in the
@@ -331,7 +338,7 @@ episode rows or task mappings.
   - Acceptance: all four `--help` paths run; `sync --help` does not mutate the corpus or
     dependency files.
 
-- [ ] **1.2** Implement safe config parsing and normalized layout derivation
+- [x] **1.2** Implement safe config parsing and normalized layout derivation
   (`zdata_pipeline/config.py`).
   - Add dataclasses for source, output, video, state/action entries, tasks, selection,
     warnings, continuity, and training.
@@ -342,7 +349,7 @@ episode rows or task mappings.
   - Acceptance: unit tests cover defaults, path expansion, unknown-key behavior, contiguous
     slices, 9D EEF blocks, and invalid enum/rot6d layouts.
 
-- [ ] **1.3** Add `configs/embodiments/semihumanoid.yaml` and artifact rendering.
+- [x] **1.3** Add `configs/embodiments/semihumanoid.yaml` and artifact rendering.
   - Preserve the current three cameras, 32D canonical state, 20D action, action horizon 40,
     executed-action source, transforms, task text, warning thresholds, and measured local
     training values.
@@ -353,7 +360,7 @@ episode rows or task mappings.
 
 ### Phase 2 — Incremental `sync` and existing-corpus adoption
 
-- [ ] **2.1** Extract and generalize the zdata reader (`zdata_pipeline/source.py`).
+- [x] **2.1** Extract and generalize the zdata reader (`zdata_pipeline/source.py`).
   - Move deterministic discovery, HDF5 metadata reads, named field resolution, canonical
     assembly, and rot6d conversion from the current converter.
   - Return a source description plus zero or more `[start, end)` continuity segments;
@@ -362,7 +369,7 @@ episode rows or task mappings.
   - Acceptance: the current 32D and 46D native state layouts both yield the same configured
     32D state/20D action, and the GR00T rot6d round-trip remains numerically correct.
 
-- [ ] **2.2** Implement video/parquet staging and deterministic final commit
+- [x] **2.2** Implement video/parquet staging and deterministic final commit
   (`zdata_pipeline/convert.py`).
   - Stage canonical row data without final episode/global/task indices and stage each
     camera MP4 using the existing ffmpeg pipe.
@@ -375,12 +382,14 @@ episode rows or task mappings.
     or committed; interruption after each replacement boundary is recoverable; the next
     `sync` rolls the transaction forward and retries only unfinished input.
 
-- [ ] **2.3** Implement version-2 ledgers, stable tasks/splits, and `--reconvert`.
+- [x] **2.3** Implement version-2 ledgers, stable tasks/splits, and `--reconvert`.
   - Store one completed source record with one or more segment assignments, or one skipped
     source record with its reason; leave failed sources unrecorded.
   - Within each output dataset, preserve existing `tasks.jsonl` indices and text, then append
     new task IDs by first committed output index. Warn on later text drift and keep the old
-    text unless `tasks.text_overrides` supplies a replacement.
+    text unless `tasks.text_overrides` supplies a replacement. Apply edited overrides to
+    existing task/episode metadata on the next no-new-data sync without invalidating numeric
+    statistics.
   - Assign the train/validation split once per source path and apply it to every segment from
     that source so continuity splitting cannot leak one recording across both sides.
   - Accept `--reconvert <subset>/<relative-source-path>` as a repeatable, unambiguous
@@ -393,7 +402,7 @@ episode rows or task mappings.
   - Acceptance: insertion/backfill does not renumber or move old episodes; content repair of
     equal length rewrites the same outputs and invalidates only affected dataset stats.
 
-- [ ] **2.4** Generate LeRobot metadata and invalidate stats only after a changed commit.
+- [x] **2.4** Generate LeRobot metadata and invalidate stats only after a changed commit.
   - Derive `info.json`, `episodes.jsonl`, `tasks.jsonl`, `modality.json`, and `_layout.json`
     from the completed ledger and normalized config.
   - Compare direct layout values before appending; do not compare source roots, counts,
@@ -409,19 +418,20 @@ episode rows or task mappings.
   - Acceptance: metadata totals and canonical slices equal final files, and a no-op `sync`
     changes no output bytes.
 
-- [ ] **2.5** Add transparent version-1 ledger adoption for the existing working root.
+- [x] **2.5** Add transparent version-1 ledger adoption for the existing working root.
   - Discover every current ledger at runtime; do not hardcode seven subsets or current
     episode counts.
   - Seed task ID/index associations using configured text overrides and existing
     `tasks.jsonl`; verify old modality slices and camera map before writing `_layout.json`.
-  - Acceptance: `sync --dry-run` against `semihumanoid_260818` reports all current entries as
-    already complete, proposes no parquet/video rewrite, and shows only the ledger/layout
-    metadata migration without changing any bytes. The subsequent migration changes only
-    ledger/layout metadata and leaves both stats files intact.
+  - Acceptance: `sync --dry-run` against `semihumanoid_260818` reports every ledger entry as
+    already complete, reports any source paths appended since the previous conversion
+    separately, proposes no rewrite of existing parquet/video files, and changes no bytes.
+    A migration-only sync changes only ledger/layout metadata and leaves both stats files
+    intact.
 
 ### Phase 3 — `stats`, `check`, and `train`
 
-- [ ] **3.1** Implement dataset enumeration and bounded parallel stats
+- [x] **3.1** Implement dataset enumeration and bounded parallel stats
   (`zdata_pipeline/check.py`, `run_zdata_pipeline.py`).
   - Reuse `meta/info.json` discovery and `_val` suffix separation.
   - Launch `gr00t/data/stats.py` with the generated modality path in independent subprocesses;
@@ -430,7 +440,7 @@ episode rows or task mappings.
     are regenerated in the required order; any subprocess failure is summarized and yields
     a nonzero command exit.
 
-- [ ] **3.2** Implement lightweight and optional full output checks.
+- [x] **3.2** Implement lightweight and optional full output checks.
   - Default: reconcile ledger/meta counts, verify expected files for the lowest-index episode
     in each dataset, inspect parquet columns/dtypes/shapes, and decode one frame per configured
     camera.
@@ -440,7 +450,7 @@ episode rows or task mappings.
   - Acceptance: default work is bounded per dataset; `--full` catches an intentional index
     gap or missing video in a temporary test corpus.
 
-- [ ] **3.3** Implement epoch-derived training and explicit resume.
+- [x] **3.3** Implement epoch-derived training and explicit resume.
   - Enumerate train datasets, auto-run missing stats, import the generated modality module,
     open one loader sample, calculate current starts/steps, and print the final command.
   - Map every configured value to supported `FinetuneConfig` flags, including explicit
@@ -452,7 +462,7 @@ episode rows or task mappings.
 
 ### Phase 4 — Bounded validation and cutover
 
-- [ ] **4.1** Port the existing focused tests and add append transaction coverage
+- [x] **4.1** Port the existing focused tests and add append transaction coverage
   (`scripts/lerobot_conversion/test_zdata_pipeline.py`).
   - Preserve all transformation/layout/split tests from the current suite.
   - Add temporary-config, generated-artifact, task-growth, warning-vs-failure, gap-segment,
@@ -461,7 +471,7 @@ episode rows or task mappings.
   - Mock ffmpeg/subprocesses in unit tests; reserve real encoding for the bounded pilot.
   - Acceptance: the test module is corpus-independent and CPU-safe with the h5py overlay.
 
-- [ ] **4.2** Run a bounded real-data pilot without rebuilding the corpus.
+- [x] **4.2** Run a bounded real-data pilot without rebuilding the corpus.
   - Build a temporary source root containing one current 32D episode and one current 46D
     episode, convert to a temporary output root, and compare canonical state/action arrays
     with the current converter.
@@ -470,7 +480,7 @@ episode rows or task mappings.
   - Acceptance: arrays and task/camera mapping agree; loader columns/shapes are correct;
     repeated `sync` is a byte-preserving no-op.
 
-- [ ] **4.3** Adopt the existing working corpus and exercise one ordinary append.
+- [x] **4.3** Adopt the existing working corpus and exercise one ordinary append.
   - Back up only the small `_ledgers/` and `meta/` JSON/JSONL files before first migration;
     do not copy, delete, or rebuild parquet/video data.
   - Run dry-run, ledger adoption, default `check`, append any currently new source episodes,
@@ -478,7 +488,7 @@ episode rows or task mappings.
   - Acceptance: old episode/global indices are unchanged, new ones are contiguous, only
     changed datasets lose/regain stats, and no manifest/source-identity artifact is created.
 
-- [ ] **4.4** Run a short training smoke and cut over maintained entry points.
+- [x] **4.4** Run a short training smoke and cut over maintained entry points.
   - Use the complete multi-dataset train path with a temporary config setting a small
     `max_steps`; require finite loss and a clean exit.
   - Remove the three superseded semihumanoid-only entry points and old test after the smoke
@@ -548,6 +558,25 @@ git diff --check
 The GPU smoke command uses a temporary copy of the semihumanoid YAML with a small
 `train.max_steps` and temporary `train.out_base`; it is intentionally not part of routine
 CPU validation.
+
+## Implementation record
+
+- The focused generalized pipeline suite passes all 46 tests with the on-demand `h5py`
+  overlay. The repository CPU suite passes 703 tests, with 2 skipped and 35 GPU tests
+  deselected.
+- The bounded real-data pilot covered one native 32D UBE episode and one native 46D Matcha
+  episode. Canonical arrays matched the legacy converter exactly; real ffmpeg, stats, full
+  checks, loader shapes, three-view visual sampling, and a byte-preserving no-op all passed.
+- Live adoption preserved 1,857 prior assignments and appended one newly discovered source
+  at the next validation episode/global indices. All 14 outputs pass `check`; only the
+  changed dataset regenerated stats. The metadata backup is
+  `~/ml_data/data/training_data/gr00t/semihumanoid_260818_metadata_backup_20260819T070503Z`.
+- A four-GPU, seven-train-dataset, one-step smoke completed cleanly with finite
+  `train_loss: 1.328125`. Its isolated 40 GiB temporary pilot/checkpoint tree was deleted
+  afterward and is not recoverable.
+- `pre-commit run --all-files`, `uv lock --locked`, manifest alignment, and
+  `git diff --check` pass. The pipeline creates no manifest or source-identity artifact; it
+  leaves the pre-existing legacy `manifest.json` inert and untouched.
 
 ## Completion criteria
 
