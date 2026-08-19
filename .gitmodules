@@ -10,3 +10,6 @@
 [submodule "external_dependencies/robocasa"]
 	path = external_dependencies/robocasa
 	url = https://github.com/squarefk/robocasa
+[submodule "packages/industrialnext_rpc"]
+	path = packages/industrialnext_rpc
+	url = git@github.com:industrialnext/industrialnext_rpc.git

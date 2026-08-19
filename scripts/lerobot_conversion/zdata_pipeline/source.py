@@ -11,6 +11,7 @@ from io import BytesIO
 from pathlib import Path
 import subprocess
 
+from gr00t.data.state_action.rot6d import rot6d_source_to_groot
 import h5py
 import numpy as np
 import pandas as pd
@@ -46,34 +47,6 @@ class StagedSegment:
 class StagedSource:
     description: SourceDescription
     segments: tuple[StagedSegment, ...]
-
-
-def _normalize_rotation_axis(value: np.ndarray, axis_name: str) -> np.ndarray:
-    norm = np.linalg.norm(value, axis=-1, keepdims=True)
-    if np.any(norm <= 1e-12):
-        raise ValueError(f"rot6d has a degenerate {axis_name} axis")
-    return value / norm
-
-
-def rot6d_source_to_groot(value: np.ndarray) -> np.ndarray:
-    """Convert source first-two-columns rot6d to GR00T first-two-rows rot6d."""
-    array = np.asarray(value, dtype=np.float64)
-    if array.shape[-1] != 6:
-        raise ValueError(f"rot6d must have last dim 6, got {array.shape}")
-    if not np.isfinite(array).all():
-        raise ValueError("rot6d contains non-finite values")
-    first = _normalize_rotation_axis(array[..., :3], "first")
-    second = array[..., 3:6]
-    second = second - np.sum(first * second, axis=-1, keepdims=True) * first
-    second = _normalize_rotation_axis(second, "second")
-    third = np.cross(first, second)
-    return np.concatenate(
-        [
-            np.stack([first[..., 0], second[..., 0], third[..., 0]], axis=-1),
-            np.stack([first[..., 1], second[..., 1], third[..., 1]], axis=-1),
-        ],
-        axis=-1,
-    )
 
 
 def resolve_field_slices(group: h5py.Group) -> dict[str, tuple[int, int]]:
