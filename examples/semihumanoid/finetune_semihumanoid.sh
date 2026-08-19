@@ -40,7 +40,13 @@ cd /home/yskim/ws/Isaac-GR00T
 
 # --- knobs ---------------------------------------------------------------------------
 BATCH=${BATCH:-256}          # global, pre-accumulation; per-GPU = BATCH/GPUS
-STEPS=${STEPS:-3750}         # 3750 x 256 = 960k samples = 2.2 epochs over 440,280 starts
+STEPS=${STEPS:-5250}         # 5250 x 256 = 1.344M samples = ~2.2 epochs of the 2026-08-19
+                             # corpus (610,953 trainable 40-step starts).
+                             # RE-DERIVE THIS WHENEVER DATA IS ADDED: it is an absolute step
+                             # count, so a stale value silently trains fewer epochs. Get the
+                             # current start count from
+                             #   scripts/lerobot_conversion/semihumanoid_datasets.py --out-root <root>
+                             # then steps = 2.2 * starts / BATCH.
 LR=${LR:-2.8e-4}             # sqrt-scaled from the repo's 1e-4 @ batch 32 (sqrt(256/32)=2.83)
 GPUS=${GPUS:-4}
 WORKERS=${WORKERS:-8}        # was 4; the aborted run showed 80 ongoing shard-wait stalls (250s)
