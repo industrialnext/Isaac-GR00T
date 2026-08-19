@@ -1,336 +1,476 @@
 # Config-Driven zdata_hdf5 → GR00T Pipeline — Design
 
 **Date:** 2026-08-19
-**Status:** Approved, ready for implementation planning
-**Supersedes (partially):** the hardcoded `scripts/lerobot_conversion/convert_semihumanoid.py`
-**Related:** the one-off semihumanoid pipeline this generalizes, shipped in commit `2e64dd6`
-(`scripts/lerobot_conversion/convert_semihumanoid.py`). Its detailed execution plan and the
-source-data survey artifacts are kept machine-local under `docs/local/` (git-ignored) and are
-not required to implement this design.
+
+**Status:** Revised; ready for implementation planning
+
+**Supersedes (partially):** the hardcoded
+`scripts/lerobot_conversion/convert_semihumanoid.py`
+
+**Related:**
+[`2026_0818_semihumanoid_gr00t_conversion_plan.md`](2026_0818_semihumanoid_gr00t_conversion_plan.md),
+which records the completed semihumanoid conversion and training work. Where that plan
+describes a sealed release manifest, catalog-version admission, or a full-corpus migration
+gate, this document defines the simpler behavior for the generalized pipeline.
 
 ---
 
-## Motivation
+## Purpose
 
-The semihumanoid pipeline works — 1,762 train episodes / 679,671 frames converted, GR00T
-finetuning verified end to end. But every fact about the data layout is a module constant
-in `convert_semihumanoid.py`: `CAMERA_MAP`, `STATE_FIELDS`, `ACTION_FIELDS`, `TASK_ORDER`,
-the QC thresholds, the rot6d handling, and the 50 Hz assumption. A second embodiment means
-either editing that file (and breaking the first) or copying it (and diverging).
+Internal zdata datasets are working datasets. During collection, new episode directories
+may arrive several times a day, and users should be able to append them and try another run
+without creating a release, pinning a source snapshot, or satisfying an admission process.
 
-The layout is also declared **twice**: as slice offsets inside the converter, and again as
-`ModalityConfig` keys in `examples/semihumanoid/semihumanoid_config.py`. Nothing checks that
-the two agree. This session already produced one silent, plausible-looking failure from a
-*convention* mismatch (source rot6d encodes the first two **columns** of R, GR00T decodes
-the first two **rows** — a 170° error that trains without complaint). A *layout* mismatch is
-the same class of bug, one edit away.
+The existing semihumanoid converter already handles the hard data-format details, but its
+camera map, selected fields, action source, task order, quality rules, and GR00T modality
+keys are Python constants. Copying the script for every embodiment would make those copies
+drift. The generalized pipeline moves only those layout choices into one small YAML file
+and keeps the zdata_hdf5 reader and LeRobot writer shared.
 
-**Target state:** one YAML per embodiment is the single source of truth. It generates both
-`meta/modality.json` and the Python `ModalityConfig`, so they cannot disagree. One command
-runs profile → convert → stats → validate → train.
+The target workflow is deliberately short:
+
+```bash
+# Append source episodes not processed before.
+uv run python scripts/lerobot_conversion/run_zdata_pipeline.py sync \
+  --config configs/embodiments/semihumanoid.yaml
+
+# Refresh required statistics if data changed, then launch training.
+uv run python scripts/lerobot_conversion/run_zdata_pipeline.py train \
+  --config configs/embodiments/semihumanoid.yaml
+```
+
+`sync` never launches training. Re-running it after more collection is the normal operating
+model, not a special release operation.
+
+## Design principles
+
+1. **The corpus may keep growing.** Counts, source timestamps, and source-tree contents are
+   observations, not a sealed contract.
+2. **One config describes the data layout.** The same state, action, camera, and annotation
+   entries drive conversion, `meta/modality.json`, and the Python `ModalityConfig`.
+3. **Only unusable data stops conversion.** Structural problems that prevent correct
+   reading or writing are errors. Quality anomalies are reported and, unless explicitly
+   selected out by the config, do not block an append.
+4. **Successful work is retained.** A bad episode does not roll back other episodes. A
+   later `sync` retries unfinished inputs.
+5. **Meaning remains an operator decision.** The config says which action array and fields
+   to use. The pipeline checks that they can be read consistently; it does not try to prove
+   that the selected action represents the intended command semantics.
 
 ### Non-goals
 
-- **A reader-plugin interface.** Confirmed: all future data comes from the same
-  `zdata_hdf5` recorder, with different *layouts*. One reader stays in code. If a genuinely
-  different source format ever appears, that is when to add the abstraction — not now.
-- **Multi-embodiment training in a single run.** GR00T's sharded trainer takes one
-  embodiment tag; mixing is out of scope.
-- **A config-driven eval harness.** `gr00t/eval/open_loop_eval.py` already reads its
-  modality config from the checkpoint (`open_loop_eval.py:323`), so it needs nothing here.
-- **Depth, progress prediction, state history.** GR00T N1.7 has no depth modality and no
-  progress head, and every in-tree embodiment uses `delta_indices=[0]` for state and video.
+- Dataset sealing, immutable release manifests, content checksums, source fingerprints, or
+  strict source-identity checks.
+- A reader plug-in framework. This design supports the shared `zdata_hdf5` format with
+  different layouts. A second reader abstraction is justified only by a second format.
+- Multi-embodiment training in one GR00T run.
+- A config-driven evaluation harness. GR00T evaluation loads the modality config saved in
+  the checkpoint.
+- Automatic inference of action ownership, task meaning, or camera meaning.
+- Depth, progress prediction, or state-history support not consumed by GR00T N1.7.
+- Full-corpus scans on every append.
 
 ---
 
-## Architecture
+## Minimal architecture
 
-```
+```text
 scripts/lerobot_conversion/
-├── run_pipeline.py              CLI: stages, --set overrides, orchestration
+├── run_zdata_pipeline.py          # sync, stats, check, and train commands
 └── zdata_pipeline/
-    ├── config.py                YAML → validated dataclasses
-    ├── reader.py                zdata_hdf5 access (the single supported format)
-    ├── layout.py                field→key resolution, rot6d re-encode, canonical vectors
-    ├── qc.py                    configurable quality gate
-    ├── writer.py                LeRobot v2 emission, ledger, stats invalidation
-    ├── modality.py              generates modality.json AND the Python ModalityConfig
-    └── validate.py              loader round-trip, rot6d round-trip, stats ranges
+    ├── config.py                  # YAML parsing and derived canonical layout
+    ├── source.py                  # zdata_hdf5 reading, field assembly, rot6d conversion
+    ├── convert.py                 # discovery, selection, LeRobot writing, append ledger
+    └── check.py                   # small post-write checks and optional full diagnostics
 
 configs/embodiments/semihumanoid.yaml
-examples/semihumanoid/semihumanoid_config.py     (generated; committed for reproducibility)
+examples/semihumanoid/semihumanoid_config.py     # generated from the YAML
 ```
 
-Each module has one job and a narrow interface:
+The CLI contains orchestration and training command construction. `source.py` is the only
+module that knows the HDF5 structure. Video writing and `meta/` generation stay together in
+`convert.py` because they are one conversion transaction; separate writer, layout, QC,
+modality, and validation frameworks would add interfaces without adding another use case.
 
-| Module | Responsibility | Depends on |
-|---|---|---|
-| `config.py` | Parse + validate YAML. Reject unknown keys, bad enums, non-contiguous EEF blocks, horizon > model ceiling. | nothing |
-| `reader.py` | Open an `episode.h5`; expose attrs, `state/flat`, `action/<source>`, `field_names`/`field_slices`, and per-camera `blob`/`offsets`/`frame_ref_index`/`frame_age_ms`. | h5py |
-| `layout.py` | Resolve configured field names against the episode's own `field_slices`; apply rot6d re-encoding; assemble canonical state/action arrays; derive slice offsets. | reader, config |
-| `qc.py` | Evaluate one episode against the configured gate; return pass/fail plus per-camera measurements and reasons. | reader, config |
-| `writer.py` | Ledger read/write, episode index + split assignment, parquet + MP4 emission, `meta/` regeneration, stats invalidation. | layout, config |
-| `modality.py` | Emit `meta/modality.json` and the Python `ModalityConfig` file from the same config object. | config |
-| `validate.py` | Post-conversion assertions against GR00T's own code paths. | gr00t, config |
+## Configuration
 
-`reader.py` is the only module that knows the HDF5 layout. If the recorder schema ever
-changes, exactly one file moves.
-
----
-
-## Config schema
+The schema is intentionally permissive about extra source fields and attributes. It names
+only what the conversion consumes. Optional sections may be omitted. Unknown keys in a
+state, action, or camera layout are errors because silently ignoring a misspelled layout
+key would change the training tensors; unknown keys elsewhere are warnings.
 
 ```yaml
-name: semihumanoid                  # dataset dir prefix; embodiment tag is always
-                                    # NEW_EMBODIMENT (GR00T projector slot 10)
+name: semihumanoid
 
 source:
   root: ~/ml_data/data/training_data/semihumanoid
-  subsets: ["flexiv_*"]             # explicit list or glob
+  subsets: ["flexiv_*"]
   episode_glob: "*/20*/*/*/*/episode.h5"
   exclude_path_contains: ["_failed_recordings"]
-  fps: 50                           # asserted against each episode's sampling_hz
-  image_hw: [256, 256]
+  fps: 50
 
 output:
-  root: ~/ml_data/data/training_data/gr00t/semihumanoid_260818
-  name_transform: {strip_prefix: "flexiv_"}     # flexiv_ube_v4 -> ube_v4
+  root: ~/ml_data/data/training_data/gr00t/semihumanoid_working
+  strip_subset_prefix: "flexiv_"
+  val_every: 20                    # deterministic path-based split; 0 disables validation
 
-cameras:                            # canonical key -> source group under images/
+cameras:                           # canonical GR00T key -> zdata image group
   head: head_rgb
   left_wrist: eoat_left_bottom_rgb
   right_wrist: eoat_right_bottom_rgb
-video: {codec: libx264, crf: 23, preset: veryfast, gop: 50}
 
-state:                              # ordered -> canonical vector + derived slices
-  - {key: left_eef,      fields: [left_arm_pose_pos, left_arm_pose_rot], rot6d_transpose: true}
-  - {key: left_gripper,  fields: [left_gripper]}
-  - {key: left_ft,       fields: [left_ft]}
-  - {key: right_eef,     fields: [right_arm_pose_pos, right_arm_pose_rot], rot6d_transpose: true}
+video:
+  codec: libx264
+  crf: 23
+  preset: veryfast
+
+state:                              # order defines observation.state
+  - key: left_eef
+    fields: [left_arm_pose_pos, left_arm_pose_rot]
+    rot6d: source_columns_to_groot_rows
+  - {key: left_gripper, fields: [left_gripper]}
+  - {key: left_ft, fields: [left_ft]}
+  - key: right_eef
+    fields: [right_arm_pose_pos, right_arm_pose_rot]
+    rot6d: source_columns_to_groot_rows
   - {key: right_gripper, fields: [right_gripper]}
-  - {key: right_ft,      fields: [right_ft]}
+  - {key: right_ft, fields: [right_ft]}
 
 action:
-  source: executed                  # action/<source>; asserts action/residual == 0 if present
-  horizon: 40                       # must be <= the base checkpoint's action_horizon
+  source: executed                 # reads action/executed; chosen by the dataset owner
+  horizon: 40
   keys:
-    - {key: left_eef,  fields: [left_arm_pose_pos, left_arm_pose_rot], rot6d_transpose: true,
-       rep: RELATIVE, type: EEF, format: XYZ_ROT6D, state_key: left_eef}
-    - {key: left_gripper,  fields: [left_gripper],  rep: ABSOLUTE, type: NON_EEF, format: DEFAULT}
-    - {key: right_eef, fields: [right_arm_pose_pos, right_arm_pose_rot], rot6d_transpose: true,
-       rep: RELATIVE, type: EEF, format: XYZ_ROT6D, state_key: right_eef}
-    - {key: right_gripper, fields: [right_gripper], rep: ABSOLUTE, type: NON_EEF, format: DEFAULT}
+    - key: left_eef
+      fields: [left_arm_pose_pos, left_arm_pose_rot]
+      rot6d: source_columns_to_groot_rows
+      rep: RELATIVE
+      type: EEF
+      format: XYZ_ROT6D
+      state_key: left_eef
+    - {key: left_gripper, fields: [left_gripper], rep: ABSOLUTE,
+       type: NON_EEF, format: DEFAULT}
+    - key: right_eef
+      fields: [right_arm_pose_pos, right_arm_pose_rot]
+      rot6d: source_columns_to_groot_rows
+      rep: RELATIVE
+      type: EEF
+      format: XYZ_ROT6D
+      state_key: right_eef
+    - {key: right_gripper, fields: [right_gripper], rep: ABSOLUTE,
+       type: NON_EEF, format: DEFAULT}
 
-qc:
-  coverage: [0.45, 0.80]            # per canonical camera: image_count / frame_count
-  age_p99_ms: 150
-  min_frames: 41                    # > action.horizon, else the episode yields no chunk
-  policy_types: [expert]            # episode dir suffix allowlist
+tasks:
+  id_attr: task_uuid
+  text_attr: task_text
+  text_overrides: {}               # optional task ID -> preferred instruction text
 
-tasks:                              # stable index order; text is the fallback when an
-  generic_pick:      "Pick the grounded target object and hold it securely in the gripper."
-  generic_place:     "Place the currently held object at the grounded destination and release it."
-  bracket_handover:  "Hand over the bracket from the gripper holding it to the opposite gripper and secure it in the receiving gripper."
+select:                             # cheap, intentional source selection only
+  require_valid_for_training: true
+  policy_types: [expert]
 
-split: {val_every: 20}              # hash-based; 0 disables
+warn:                               # observations, not admission gates
+  camera_coverage_below: 0.45
+  camera_age_p99_ms_above: 150
+  frame_gap_ms_above: 40
+  nonzero_action_residual: true
+
+continuity:
+  split_on_gap_ms: null             # null preserves current episode boundaries
 
 train:
   base_model: nvidia/GR00T-N1.7-3B
   out_base: ~/ml_data/outputs/gr00t
   gpus: 4
-  batch: 256                        # global, pre-accumulation; must divide gpus
+  batch: 256
+  epochs: 2.2                       # max_steps may be supplied instead
+  max_steps: null
   lr: 2.8e-4
-  steps: 5250                       # sized to ~2.2 epochs of the CURRENT corpus; see note
   workers: 8
   save_steps: 1000
   save_total_limit: 5
   state_dropout_prob: 0.2
-  shortest_image_edge: 256          # must match the base checkpoint's declared values
+  shortest_image_edge: 256
   crop_fraction: 0.95
   color_jitter: {brightness: 0.15, contrast: 0.15, saturation: 0.2, hue: 0.1}
   use_wandb: false
 ```
 
-**`steps` must be re-derived whenever the corpus grows, and this is easy to forget.** It is an
-absolute step count, so a fixed value silently trains *fewer* epochs as data is appended. The
-2026-08-19 expansion (+417 episodes) took the trainable 40-step start indices from 440,280 to
-610,953 (+39%), which turned the previously-correct 3,750 steps into 1.57 epochs instead of
-2.18. At batch 256, ~2.2 epochs is now 5,250 steps (~2.77 h at the measured 134.7 samples/s).
+Extra HDF5 fields, unselected cameras, and unrelated attributes are ignored. Required
+field widths are read from each episode's `field_slices`; the assembled canonical widths
+must remain the same within an output dataset. An EEF action entry must resolve to 9 values
+(XYZ + rot6d), because that is required by GR00T's EEF representation.
 
-Implementation note: `validate` should report `steps x batch / trainable_starts` as the
-effective epoch count, so a stale `steps` is visible before the run rather than after.
+With `require_valid_for_training: true`, an explicit false source value is skipped. A
+missing value is accepted with a warning, so older recordings do not need a metadata
+migration. A configured `policy_types` list is an intentional selection rule; omit it to
+accept every policy type.
 
-### Two deliberate schema decisions
+`rot6d` is explicit because the source recorder and GR00T use different 6D rotation
+conventions. On an entry that sets `rot6d`, the transform applies to its single 6D rotation
+field, not to the position field or the concatenated block; the entry is invalid if that
+rotation field cannot be identified unambiguously. A field-name heuristic would recreate
+the earlier silent orientation error.
 
-**Slice offsets are derived, never authored.** Widths come from each episode's own
-`field_slices`, and the canonical layout is the concatenation of `state`/`action` entries in
-order. This means a config cannot declare a 10-dim EEF block: `config.py` asserts that any
-key with `type: EEF` resolves to exactly 9 dims (3 translation + 6 rot6d), which is what
-`EndEffectorPose.from_action_format` requires (`pose.py:681`).
+The example batch of 256 was measured on four local RTX 4090 cards reporting 49,140 MiB
+each. It is not a default for ordinary 24 GiB 4090 cards; those users must select a batch
+that fits their hardware.
 
-**`rot6d_transpose` is explicit per key, not inferred.** The current code guesses from a
-`_pose_rot` name suffix. That is correct for this recorder and fragile for the next one.
-Making it explicit forces whoever adds an embodiment to answer the question that already
-cost us a silent 170° error.
+### Tasks grow with the data
 
----
-
-## Single source of truth: generated modality config
-
-`modality.py` emits two artifacts from one config object:
-
-1. **`<dataset>/meta/modality.json`** — `state`/`action` slice maps, `video` canonical→
-   `observation.images.<key>` mapping, and `annotation.human.task_description` pointing at
-   `original_key: task_index` (the loader follows that indirection,
-   `lerobot_episode_loader.py:381`, so no `annotation.*` parquet column is needed).
-2. **`examples/<name>/<name>_config.py`** — a generated Python module that builds the
-   `ModalityConfig` dict and calls `register_modality_config(...,
-   EmbodimentTag.NEW_EMBODIMENT)`. Python is required because that is the only interface
-   GR00T exposes for custom embodiments; `--modality-config-path` imports the file
-   (`launch_finetune.py:31-40`).
-
-The generated Python carries a `# GENERATED — edit configs/embodiments/<name>.yaml` header
-and a hash of the source config. `validate` re-generates in memory and fails if the
-committed file differs, so hand-edits are caught rather than silently overriding the YAML.
+Task IDs and text come from each episode by default. The first occurrence of a new task ID
+appends it to that output dataset's `meta/tasks.jsonl`; existing task indices never move.
+Later catalog-version changes are ignored. If the same task ID arrives with different text,
+`sync` warns and keeps the existing text unless `tasks.text_overrides` explicitly replaces
+it. New tasks therefore require no catalog release or schema update.
 
 ---
 
-## Stages
+## Output layout
 
-`run_pipeline.py <stage> --config configs/embodiments/<name>.yaml [--set k=v ...]`
+Each source subset maps to one LeRobot v2.1 training dataset and, when `val_every` is
+enabled, a sibling `<name>_val` dataset. The on-disk shape remains the one consumed by the
+current GR00T loader:
 
-| Stage | Does | Idempotent |
-|---|---|---|
-| `profile` | Survey the source tree: episode counts, camera signatures, state/action dims and field names, tasks, policy types, fps, per-camera coverage/staleness. Writes a JSON report. **No writes to the corpus.** | yes |
-| `convert` | QC-gate new episodes, convert them, regenerate `meta/`, invalidate stats. Append-only via the ledger. | yes |
-| `stats` | Run `gr00t/data/stats.py` per dataset **in parallel** (one process each). | yes (fingerprint-cached) |
-| `validate` | Assertions below. | yes |
-| `train` | Preflight, then `torchrun` the finetune. | no |
-| `all` | profile → convert → stats → validate → train | — |
+```text
+<output-root>/
+├── _ledgers/<subset>.json
+├── _staging/
+├── <name>/
+│   ├── data/chunk-*/episode_*.parquet
+│   ├── videos/chunk-*/observation.images.<camera>/episode_*.mp4
+│   ├── meta/{info,modality,stats,relative_stats}.json
+│   ├── meta/{episodes,tasks}.jsonl
+│   └── _layout.json
+└── <name>_val/                    # only when validation splitting is enabled
+```
 
-`profile` exists because it is how this session caught the 46-dim state shift, the
-mislabelled matcha_v1 cameras, and the 2026/08/12 camera-dropout day. Discovering that by
-hand each time is the expensive part.
-
-`stats` is a stage rather than a side effect because the relative pass is CPU-bound at
-~2.5 s/episode/key and `DatasetFactory` otherwise does it serially on rank 0 before step 1
-(`factory.py:59`) — roughly 40 minutes with three GPUs idle.
-
-### Append-only guarantees (carried over, now config-driven)
-
-- **Ledger** (`<out>/_ledgers/<subset>.json`) freezes `(dataset, episode_index, split,
-  index_offset, length, task_uuid)` per source episode. Without it, indices are positional
-  and a backfilled recording date renumbers every later episode, orphaning written files.
-  The ledger also stores the camera map and refuses to run if the config's map changed.
-- **Hash-based split**: `sha256(episode_path_relative_to_subset) % val_every == 0`. A
-  positional rule moves existing episodes between train and val when earlier episodes are
-  inserted — leaking held-out data into training on the next append.
-- **Stats invalidation on append**: GR00T fingerprints `stats.json` over the `info.json`
-  feature *schema* only (`stats.py:183`), which does not change when episodes are appended.
-  Both stats files are deleted whenever an episode is written.
+Each parquet row contains `observation.state`, `action`, `timestamp`, `frame_index`,
+`episode_index`, global `index`, `task_index`, and `next.done`. For each configured camera,
+the writer follows the source `frame_ref_index` and emits one video frame per state row at
+the configured dataset rate. `stats.json` and `relative_stats.json` may be absent between a
+successful append and the next `stats` or `train` command.
 
 ---
 
-## Validation — what makes the refactor safe
+## Single layout source
 
-**Equivalence gate (blocking, run once at migration).** The generic driver converts the
-existing 7 subsets into a *fresh* output root, then asserts against the current corpus, per
-dataset: identical episode count; identical `episodes.jsonl`; identical `info.json` and
-`modality.json` (modulo key order); and for every episode, `observation.state` and `action`
-arrays equal within 0 tolerance, plus identical `timestamp`/`task_index`/`index`/
-`frame_index` columns. Video files are compared by frame count and decoded-frame checksums
-at 3 sampled indices rather than byte-identity, since h264 encoding is not bit-reproducible
-across runs. `convert_semihumanoid.py` is deleted only after this passes.
+The pipeline derives canonical slice offsets from the ordered `state` and `action.keys`
+entries and emits both:
 
-**Ongoing `validate` stage.** Per dataset:
+1. `<dataset>/meta/modality.json`, including state/action slices, canonical video mappings,
+   and `annotation.human.task_description` with `original_key: task_index`. No separate
+   annotation column is written to parquet.
+2. `examples/<name>/<name>_config.py`, which registers the same modality keys under
+   `EmbodimentTag.NEW_EMBODIMENT` for `--modality-config-path`.
 
-1. `meta/stats.json` exists — the loader asserts it (`lerobot_episode_loader.py:180`).
-2. `info.json.features` declares `action` and `observation.state` as `float32`, since
-   `generate_stats` only computes statistics for features whose dtype contains `"float"`
-   (`stats.py:251`). Wrong dtype ⇒ no statistics ⇒ silently unnormalized training.
-3. `LeRobotEpisodeLoader` round-trip yields exactly the expected column set.
-4. `relative_stats.json` contains exactly the `RELATIVE` action keys, each shaped
-   `(horizon, dim)`.
-5. Per-dim `q99 − q01` ≥ 1e-4 for every relative key — `normalize_values_minmax`
-   (`data/utils.py:106`) zeroes dims where min≈max but *amplifies* tiny-but-nonzero ranges.
-6. **rot6d round-trip on real converted data**: rebuild R from the written 9-dim block using
-   GR00T's `_rot6d_to_matrix` and compare against the source decoded with the source
-   convention; assert angular error < 1e-4 deg.
-7. Structural invariants: parquet count == `episodes.jsonl` length; concatenated `index`
-   contiguous from 0; per-episode `frame_index` 0..n−1; `info.json.total_frames` == sum.
-8. Generated `ModalityConfig` matches the YAML (hash check).
+The generated `ModalityConfig` uses `delta_indices=[0]` for video and state and
+`delta_indices=list(range(action.horizon))` for action. It translates each action entry's
+`rep`, `type`, `format`, and optional `state_key` directly into GR00T `ActionConfig`
+values.
 
-**Unit tests** (no GPU, no corpus): rot6d round-trip vs GR00T's decoder plus a guard
-asserting the naive passthrough is still wrong; name-based field selection across both the
-32-dim and 46-dim schemas; config validation rejects non-9-dim EEF, horizon > ceiling,
-batch not divisible by gpus, unknown enum values; hash split stability under insertion.
+The generated Python file carries a short “generated from YAML” header and is overwritten
+when its layout changes. It contains no whole-config hash: changing a training parameter,
+source glob, warning threshold, or output path must not create a false layout mismatch.
+
+For each output dataset, the converter also writes a small `_layout.json` containing the
+direct camera-group mapping, selected state/action fields and transforms, action source,
+sampling rate, observed image shape, and derived slices. When appending, those values and
+`meta/modality.json` must still agree with the YAML. This is the one compatibility check the
+append path needs: mixing different dimensions, action arrays, or physical viewpoints under
+existing canonical columns would make the output internally ambiguous. An intentional
+layout change uses a new output directory or an explicit full rebuild. `_layout.json`
+contains no source paths, hashes, corpus counts, or source identity and does not bind the
+output to a snapshot.
 
 ---
 
-## Preflight for `train`
+## Commands and normal flow
 
-Refuses to launch unless: every train dataset has both stats files; no `_val` dataset is in
-`--dataset-path`; `batch % gpus == 0`; `action.horizon` ≤ the base checkpoint's
-`action_horizon`; state and action dims ≤ `max_state_dim`/`max_action_dim` (132); free disk
-≥ `save_total_limit × 40 GB`; GPUs idle.
+### `sync`
 
-Two footguns it also handles: **`--experiment-name` is not passed**, because
-`experiment.py:213` appends it to `--output-dir`, silently nesting the run one level deeper
-than the summary looks for. And `--shortest-image-edge`/`--crop-fraction` are always passed
-from config, because omitting them makes `launch_finetune.py` override the base checkpoint's
-declared 0.95 crop with the legacy 0.898 path, diverging from pretraining preprocessing.
+`sync` is the everyday command. For every configured subset it:
+
+1. Discovers episode files and skips paths already marked complete in the append ledger.
+2. Applies the small `select` section. Episodes explicitly marked invalid, from an
+   unselected policy type, or too short to produce a 40-step action chunk are recorded as
+   skipped; they do not fail the run.
+3. Reads configured fields by name, converts rot6d where requested, and writes parquet and
+   MP4 files. Source rows remain in their recorded order.
+4. Appends successful episodes to `episodes.jsonl` and new task IDs to `tasks.jsonl`, then
+   refreshes `info.json` and `modality.json` from current output metadata.
+5. Removes `stats.json` and `relative_stats.json` only for datasets that changed, because
+   the current GR00T stats cache does not notice episode-only appends.
+6. Prints a compact summary: discovered, already complete, added, skipped, failed, warning
+   counts, and datasets whose statistics now need refresh.
+
+Warnings for camera coverage, image age, timestamp gaps, task-text changes, or nonzero
+`action/residual` are visible in the summary but do not block conversion. The dataset owner
+can tighten `select` or add a continuity threshold later if a particular collection needs
+it.
+
+### Minimal append ledger
+
+`<output>/_ledgers/<subset>.json` is operational state, not a release manifest. It stores
+only completed assignments needed to avoid duplicate conversion and keep output indices
+stable:
+
+```text
+relative source path -> output dataset, episode index, index offset, length, task ID
+```
+
+Workers first write new episodes under `_staging/`, without final dataset indices. The main
+process commits successful staged results in relative-path order, assigning contiguous
+episode/frame indices and then atomically replacing each ledger and metadata file. Failed
+inputs receive no ledger entry and are retried by the next `sync`; successful staged work
+is not discarded because another input failed. On startup, `sync` reconciles staging and
+regenerates `meta/` from the completed ledger, so interruption between file replacements is
+recoverable. No file hash, mtime, source-tree checksum, Git SHA, catalog version, or config
+fingerprint is stored.
+
+This intentionally assumes the collector appends new episode paths and does not silently
+rewrite completed episodes in place. If an episode was repaired at the same path, the user
+runs `sync --reconvert <relative-path>`; the pipeline rewrites the same output index and
+invalidates that dataset's statistics. A renamed completed source looks new and may be
+converted again, which is an accepted tradeoff for the relaxed identity model.
+
+The validation split is computed from the relative source path, so backfilled directories
+do not move already converted episodes between train and validation. It is stable placement,
+not a content identity check.
+
+### Continuity
+
+By default, the converter preserves one output episode per source episode and reports large
+`frame/elapsed_ms` gaps. This matches the lightweight append workflow. If a collection is
+known to contain pauses that should not be crossed by GR00T action windows, setting
+`continuity.split_on_gap_ms` partitions only newly converted episodes at those gaps. The
+setting is optional rather than a corpus-admission gate.
+
+Changing the setting affects new inputs only. Use a new output directory or a deliberate
+full rebuild if earlier episodes also need repartitioning; routine appends do not rewrite
+history.
+
+### `stats`
+
+`stats` regenerates GR00T's `stats.json` and `relative_stats.json` for datasets missing
+them, running independent datasets in parallel. It is also invoked automatically by
+`train`. Unchanged datasets keep their existing files. Several `sync` runs can therefore
+accumulate new recordings without paying the stats cost until training is actually wanted.
+
+### `train`
+
+`train` performs only the checks needed to construct a valid GR00T invocation:
+
+- train dataset paths exist and do not include the generated `_val` datasets;
+- required stats exist after the automatic stats step;
+- global batch is divisible by GPU count;
+- action horizon and canonical state/action dimensions fit the base checkpoint limits;
+- the generated modality file can be imported; and
+- one loader sample can be read from the joined training datasets.
+
+It joins the training dataset paths with `os.pathsep`, matching
+`gr00t/experiment/launch_finetune.py`'s multi-dataset interface.
+
+GPU occupancy and free disk are reported, not treated as hard gates. The command always
+passes `shortest_image_edge` and `crop_fraction` so preprocessing does not fall back to a
+different legacy crop. It does not pass `--experiment-name`, avoiding an unexpected nested
+output directory.
+
+When `train.epochs` is used, the pipeline derives
+`ceil(epochs * current_trainable_starts / batch)` immediately before launch and prints both
+the resulting step count and effective epochs. `train.max_steps`, when non-null, overrides
+the derivation. A growing corpus therefore does not silently reduce the requested training
+coverage. `current_trainable_starts` is computed from train episodes after any configured
+gap splitting, with each segment contributing `max(0, length - horizon + 1)`.
+
+There is deliberately no `all` command. Data append and GPU launch remain two explicit
+operator actions.
+
+### `check` (on demand)
+
+Normal `sync` checks only episodes it touches plus the metadata it rewrites. `check` exists
+for debugging or a deliberate audit; it is not part of every append.
+
+- `check` verifies metadata counts and reads one parquet/video sample per selected dataset.
+  If statistics are already present, it also opens one GR00T loader sample; otherwise it
+  reports that the loader check is deferred to `train` after automatic stats generation.
+- `check --full` may scan all parquet/video records, recompute counts, and sample decoded
+  frames when diagnosing suspected damage.
+
+Source profiling remains a separate diagnostic activity using the existing survey helpers.
+It is useful when onboarding a new embodiment, but it is not a prerequisite for routine
+appends.
 
 ---
 
-## Error handling
+## Essential failure handling
 
-Fail loudly and early, with the episode path in the message. Specifically: a configured
-field absent from an episode, or present with an unexpected width, is an error (not a
-silent slice) — this is what protects against the 46-dim shift. A per-episode conversion
-failure is collected, removed from the ledger so a re-run retries only it, and reported;
-it does not abort the batch. QC drops are logged individually with their measured
-coverage/age into `_conversion_report.json`, never silently.
+An individual episode fails conversion only when the requested output cannot be produced
+correctly, for example:
+
+- a configured field or camera is absent;
+- the episode sampling rate differs from the output dataset's configured rate;
+- the image shape differs from the existing output dataset;
+- canonical widths differ from the existing output layout;
+- state, action, timestamp, or camera-reference lengths disagree;
+- canonical state/action contains non-finite values;
+- a camera reference is out of bounds; or
+- parquet or video writing fails.
+
+The episode path and reason are printed, other successes are kept, and `sync` exits nonzero
+after finishing the batch if any episodes failed. Re-running retries those records. Skip and
+warning details belong to the per-run console summary; they are not accumulated as
+provenance or admission artifacts.
+
+Unit tests cover the few transformations whose failure can remain numerically plausible:
+
+- source-column rot6d → GR00T-row rot6d round-trip;
+- name-based selection from both current 32-dim and 46-dim source schemas;
+- stable path-based split under insertion;
+- derived state/action slices and generated modality agreement; and
+- append/retry behavior around a partially failed episode.
 
 ---
 
 ## Migration
 
-1. Build `zdata_pipeline/` + `configs/embodiments/semihumanoid.yaml` reproducing current behavior.
-2. Generate `examples/semihumanoid/semihumanoid_config.py` from the YAML; confirm it matches the hand-written one.
-3. Run the equivalence gate against the live corpus.
-4. Delete `convert_semihumanoid.py` and `semihumanoid_datasets.py` (the latter's function becomes `run_pipeline.py` stages), keeping `test_convert_semihumanoid.py`'s assertions in the new test module.
-5. Commit; push to the fork.
+1. Add the small shared package and the semihumanoid YAML while retaining the existing
+   converter as a reference.
+2. Convert a bounded pilot containing at least one 32-dim and one 46-dim source episode;
+   compare canonical arrays and open the result through `LeRobotEpisodeLoader`.
+3. Point the generalized pipeline at the existing working output and import its current
+   episode assignments into the minimal ledger once. No source hashing or fresh full-corpus
+   rebuild is required.
+4. Run one ordinary append and one training smoke test.
+5. Remove the superseded converter/orchestration scripts after the pilot passes, preserving
+   the focused transformation and append tests.
 
----
+The existing corpus is not deleted or regenerated merely to adopt this design.
 
-## Risks
+## Tradeoffs accepted
 
-| Risk | Mitigation |
-|---|---|
-| Refactor silently changes converted output | Equivalence gate is blocking and array-exact on state/action |
-| YAML expressiveness gap for a future embodiment | `profile` reports what a source tree contains; config validation names the missing/extra fields explicitly. Accept that a genuinely new *format* needs code — that is the stated non-goal |
-| Generated Python config hand-edited, diverging from YAML | Hash header + `validate` check |
-| Config-owned training params make experiment sweeps edit the data config | `--set train.batch=128` overrides; the YAML stays the stable, versioned data description |
-| More modules ⇒ more places to look | Each module has one responsibility and a stated interface; `reader.py` is the only one that knows HDF5 |
+| Choice | Benefit | Accepted limitation |
+|---|---|---|
+| Mutable working corpus | Frequent append-and-try iterations | A run must record its dataset paths and counts separately if exact reproduction is needed |
+| Path-only append ledger | Small, fast, easy to inspect | In-place source edits need explicit `--reconvert`; renames can duplicate data |
+| Warnings for quality anomalies | Collection can continue without admission ceremonies | Operators decide whether a warning matters for a particular experiment |
+| One zdata reader | Minimal code and maintenance | A genuinely different source format requires a later reader abstraction |
+| Automatic stats refresh before training | Correct normalization without a separate checklist | Changed datasets still pay GR00T's stats-computation cost |
+| Optional gap splitting | Default behavior stays simple | With splitting disabled, action windows may cross recorded timestamp gaps |
 
-## Decisions taken (were open questions)
+## Decisions
 
-1. **YAML lives in `configs/embodiments/<name>.yaml`**; the *generated* Python
-   `ModalityConfig` stays at `examples/<name>/<name>_config.py`. Rationale: configs sit
-   together and are diffable as a set, while the generated file stays where
-   `--modality-config-path` users and the existing SO100/LIBERO examples already look.
-2. **`all` stops after `validate`; `train` is always explicit.** A typo in a data stage
-   should not cost GPU hours. `all` therefore means profile → convert → stats → validate,
-   and the operator runs `train` once the validation output looks right.
+1. The output is a continuously growing working corpus, not a sealed dataset release.
+2. The normal interface is `sync` followed, when desired, by explicit `train`.
+3. The only persistent append bookkeeping is the minimal path ledger; there are no source
+   fingerprints or release manifests.
+4. Routine checks are local to newly written episodes. Full profiling and full scans are
+   optional diagnostics.
+5. State/action/video layout comes from one YAML and is the only compatibility boundary for
+   appending to an existing output directory.
+6. Task IDs are learned and appended from episode attributes; catalog versions do not gate
+   conversion.
+7. Timestamp-gap splitting is optional and disabled by default.
+8. Training duration is epoch-based by default and re-derived from the current corpus.
 
-## Migration addendum
-
-`examples/semihumanoid/finetune_semihumanoid.sh` is superseded by `run_pipeline.py train`
-and is removed in the same commit. Its measured batch-scaling table moves into the
-`semihumanoid.yaml` header comments so the numbers survive.
-
-Note that `convert_semihumanoid.py`, `semihumanoid_datasets.py`,
-`test_convert_semihumanoid.py`, and `finetune_semihumanoid.sh` are already committed and
-pushed to the fork (`2e64dd6`). The refactor is therefore a follow-up commit that removes
-three of them and rewrites the fourth's assertions into the new test module — not a
-never-committed rewrite. Anyone who pulled `2e64dd6` gets a working pipeline either way.
+This design is implementation-ready at the architecture level. Exact CLI spelling and
+dataclass names may be adjusted during implementation without changing these decisions.
