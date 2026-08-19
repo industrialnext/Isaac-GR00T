@@ -144,8 +144,9 @@ the files marked for removal above no longer exist after the completed cutover.
   warning and are otherwise ignored.
 - Require `name` to be a valid Python identifier because it determines the generated module
   name; fail clearly instead of silently sanitizing it to a different embodiment name.
-- Expand user paths only at runtime. Keep the committed YAML portable by retaining `~`
-  rather than writing resolved machine paths back to it.
+- Accept both user-relative and repository-relative paths and resolve them only at runtime.
+  Documentation uses the repository's portable `data/` and `outputs/` symlinks rather than
+  recording resolved machine paths.
 - Derive state/action slice offsets from the configured order and the widths reported by a
   source episode. Extra source fields and cameras are ignored.
 - Require one unambiguous 6D rotation field for any entry declaring
@@ -160,8 +161,8 @@ the files marked for removal above no longer exist after the completed cutover.
   memory but writes nothing, including lock files, staging data, generated Python, layouts,
   ledgers, or metadata.
 
-The semihumanoid YAML points at the existing working output
-`~/ml_data/data/training_data/gr00t/semihumanoid_260818`, sets
+The semihumanoid YAML targets the existing working output, referred to throughout the
+documentation as `data/training_data/gr00t/semihumanoid_260818`, and sets
 `robot_type: semihumanoid_bimanual`, and preserves the current camera, state, action, video,
 and training values. Populate `tasks.text_overrides` for the three currently known task IDs
 to preserve their existing text during ledger migration; unseen task IDs still append
@@ -542,11 +543,11 @@ uv run --no-sync --with h5py python scripts/lerobot_conversion/run_zdata_pipelin
 
 # Bounded pilot config points to a temporary two-episode source/output tree.
 uv run --no-sync --with h5py python scripts/lerobot_conversion/run_zdata_pipeline.py \
-  sync --config /tmp/zdata_pipeline_pilot.yaml
+  sync --config docs/local/zdata_pipeline_pilot.yaml
 uv run --no-sync python scripts/lerobot_conversion/run_zdata_pipeline.py \
-  stats --config /tmp/zdata_pipeline_pilot.yaml
+  stats --config docs/local/zdata_pipeline_pilot.yaml
 uv run --no-sync python scripts/lerobot_conversion/run_zdata_pipeline.py \
-  check --config /tmp/zdata_pipeline_pilot.yaml
+  check --config docs/local/zdata_pipeline_pilot.yaml
 
 # Repository-level gates after cutover.
 uv lock --locked
@@ -570,7 +571,7 @@ CPU validation.
 - Live adoption preserved 1,857 prior assignments and appended one newly discovered source
   at the next validation episode/global indices. All 14 outputs pass `check`; only the
   changed dataset regenerated stats. The metadata backup is
-  `~/ml_data/data/training_data/gr00t/semihumanoid_260818_metadata_backup_20260819T070503Z`.
+  `data/training_data/gr00t/semihumanoid_260818_metadata_backup_20260819T070503Z`.
 - A four-GPU, seven-train-dataset, one-step smoke completed cleanly with finite
   `train_loss: 1.328125`. Its isolated 40 GiB temporary pilot/checkpoint tree was deleted
   afterward and is not recoverable.

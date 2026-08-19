@@ -2,8 +2,9 @@
 
 **Date:** 2026-08-18
 **Status:** Planning
-**Author:** generated from source inspection of `~/ml_data/data/training_data/semihumanoid/`, `~/industrialnext_ai/`, and this repo
-**Output dataset:** `~/ml_data/data/training_data/gr00t/semihumanoid_260818/`
+**Author:** generated from source inspection of `data/training_data/semihumanoid/`, the
+external `<industrialnext-ai-repo>/`, and this repo
+**Output dataset:** `data/training_data/gr00t/semihumanoid_260818/`
 
 > ## Corpus state as of 2026-08-19 — READ THIS BEFORE ACTING ON ANY NUMBER BELOW
 >
@@ -39,7 +40,7 @@
 
 We want to finetune `nvidia/GR00T-N1.7-3B` on the internal `semihumanoid` bimanual
 manipulation data currently consumed by the in-house DEFT-S24 pipeline
-(`~/industrialnext_ai/config/manipulation/semihumanoid/deft_s24_semihumanoid.yaml`).
+(`<industrialnext-ai-repo>/config/manipulation/semihumanoid/deft_s24_semihumanoid.yaml`).
 
 The internal data is stored in a bespoke `zdata_hdf5` format (one `episode.h5` per
 episode, JPEG-blob images, multi-rate state/image clocks). GR00T requires
@@ -47,7 +48,7 @@ GR00T-flavored **LeRobot v2**: per-episode parquet + per-camera MP4 + `meta/*.js
 `meta/modality.json`. This plan defines the conversion and the finetune run.
 
 **Target state:** a set of self-contained LeRobot v2 datasets under
-`~/ml_data/data/training_data/gr00t/semihumanoid_260818/`, one per source subset, plus a
+`data/training_data/gr00t/semihumanoid_260818/`, one per source subset, plus a
 modality config registered under `EmbodimentTag.NEW_EMBODIMENT`, plus a validated
 finetune command.
 
@@ -141,7 +142,7 @@ state (46 dims — matcha_v3, ube_v3) — adds joints, SHIFTING every downstream
 
 3. **rot6d convention mismatch — silent and severe.** Verified numerically:
    - internal `_matrix_to_rot6d` = `concat([R[:,0], R[:,1]])` → **first two columns**
-     (`~/industrialnext_ai/src/industrialnext_ai/common/rotation_representations.py:115`)
+     (`<industrialnext-ai-repo>/src/industrialnext_ai/common/rotation_representations.py:115`)
    - GR00T `_matrix_to_rot6d` = `R[:2,:].flatten()` → **first two rows**
      (`gr00t/data/state_action/pose.py:458`)
 
@@ -155,7 +156,7 @@ state (46 dims — matcha_v3, ube_v3) — adds joints, SHIFTING every downstream
 
 4. **Action/observation alignment needs no shift.** The internal config sets
    `action_source: "action"`, and `_target_start_index`
-   (`~/industrialnext_ai/src/industrialnext_ai/datasets/zdata_hdf5_dataset.py:2637`)
+   (`<industrialnext-ai-repo>/src/industrialnext_ai/datasets/zdata_hdf5_dataset.py:2637`)
    returns `frame_index` unchanged for that source — `obs_based_action_offset` applies
    only to `action_source: "observation"`. So the action chunk for observation *t* is
    `action/executed[t : t+40]`, which is exactly GR00T's `delta_indices=range(0,40)`.
@@ -280,7 +281,7 @@ regenerate on the next `gr00t/data/stats.py` run, or automatically at training s
 ### Adding data later
 
 ```bash
-OUT=~/ml_data/data/training_data/gr00t/semihumanoid_260818
+OUT=data/training_data/gr00t/semihumanoid_260818
 
 # 1. convert (only new episodes are touched; --dry-run to preview)
 uv run --no-sync --with h5py python scripts/lerobot_conversion/convert_semihumanoid.py \
@@ -325,7 +326,7 @@ weighting and exclusion stay available at train time; conversion parallelizes; a
 stats are per-subset with GR00T merging them by sampling weight.
 
 ```
-~/ml_data/data/training_data/gr00t/semihumanoid_260818/
+data/training_data/gr00t/semihumanoid_260818/
 ├── manifest.json                     # provenance: source paths, camera map, QC drops, counts, git SHAs
 ├── matcha_v2/                        # 262 eps
 │   ├── meta/{info,modality}.json  meta/{episodes,tasks}.jsonl
@@ -485,8 +486,8 @@ All line numbers below were verified against the working tree at commit `376ba89
 | `gr00t/eval/open_loop_eval.py:323` | `policy.get_modality_config()` — eval reads the modality config **from the checkpoint**, not the registry |
 | `examples/SO100/{so100_config.py,modality.json}` | closest shipped precedent for a `NEW_EMBODIMENT` config |
 | `demo_data/cube_to_bowl_5/meta/` | reference `info.json` / `episodes.jsonl` / `tasks.jsonl` shapes |
-| `~/industrialnext_ai/src/industrialnext_ai/common/rotation_representations.py:105,115` | internal rot6d (columns convention) — source side of the transpose |
-| `~/industrialnext_ai/src/industrialnext_ai/datasets/zdata_hdf5_dataset.py:2637,3170` | action-source + offset semantics we must preserve |
+| `<industrialnext-ai-repo>/src/industrialnext_ai/common/rotation_representations.py:105,115` | internal rot6d (columns convention) — source side of the transpose |
+| `<industrialnext-ai-repo>/src/industrialnext_ai/datasets/zdata_hdf5_dataset.py:2637,3170` | action-source + offset semantics we must preserve |
 
 **Verified registry state:** `new_embodiment` is *absent* from the built-in
 `MODALITY_CONFIGS` (only the 8 pretrain/posttrain tags are present), so
@@ -564,7 +565,7 @@ All line numbers below were verified against the working tree at commit `376ba89
 
 ### Phase 0 — Decisions & scaffolding
 - [x] **0.1** ~~Confirm camera preset A vs B~~ — **resolved.** Scope is the five subsets present on disk, with one uniform camera map. Record the scope and the map in `manifest.json`.
-- [x] **0.2** `mkdir -p ~/ml_data/data/training_data/gr00t/semihumanoid_260818`
+- [x] **0.2** `mkdir -p data/training_data/gr00t/semihumanoid_260818`
 - [x] **0.3** `mkdir -p examples/semihumanoid`
 - [x] **0.4** Encode the **single** canonical→physical camera map — `head`←`head_rgb`, `left_wrist`←`eoat_left_bottom_rgb`, `right_wrist`←`eoat_right_bottom_rgb` — and assert all three keys exist in every episode of every subset (verified true for all 1,426).
 
@@ -572,7 +573,7 @@ All line numbers below were verified against the working tree at commit `376ba89
 - [x] **1.1** CLI: `--source-subset`, `--out-root`, `--crf`, `--workers`, `--limit`, `--overwrite`. (No camera-preset flag — the map is uniform across all five subsets.)
 
   **Interpreter — resolved.** Neither existing environment can run this alone: the GR00T
-  venv has `pandas`/`pyarrow` but no `h5py`; `~/industrialnext_ai/.venv` has `h5py 3.16.0`
+  venv has `pandas`/`pyarrow` but no `h5py`; `<industrialnext-ai-repo>/.venv` has `h5py 3.16.0`
   but no `pandas`/`pyarrow` (so it cannot write parquet). Do **not** add `h5py` to the root
   `pyproject.toml` — that forces a `uv.lock` regeneration, and `uv lock --locked` is a
   documented validation gate (`CLAUDE.md`). Verified working answer, which leaves
@@ -594,7 +595,7 @@ All line numbers below were verified against the working tree at commit `376ba89
 - [x] **1.7** Video: for each canonical key, resolve the physical camera, then for `i in range(frame_count)` write `blob[offsets[j]:offsets[j+1]]` where `j = frame_ref_index[i]`, piped to `ffmpeg -f image2pipe -framerate 50 -c:v libx264 -preset veryfast -crf <crf> -pix_fmt yuv420p -g 50`. Assert bounds on `j`. (R3)
   - Acceptance: output frame count equals `frame_count` for every camera.
 - [x] **1.8** Parquet per episode with the column set above; `timestamp = frame/elapsed_ms / 1000`.
-- [x] **1.9** `meta/tasks.jsonl` — the 3 tasks with stable indices (`generic_pick`=0, `generic_place`=1, `bracket_handover`=2). **Read the task text from each episode's HDF5 root attrs (`task_uuid`, `task_text`), not from a `task_catalog.yaml` file** — every episode carries its own `task_uuid` / `task_text` / `task_catalog_version`, so the converter needs no external catalog and cannot drift from one. (The `ml_data` copy of `task_catalog.yaml` no longer exists; the surviving copy is `~/industrialnext_ai/config/manipulation/semihumanoid/task_catalog.yaml`, useful only for cross-checking.)
+- [x] **1.9** `meta/tasks.jsonl` — the 3 tasks with stable indices (`generic_pick`=0, `generic_place`=1, `bracket_handover`=2). **Read the task text from each episode's HDF5 root attrs (`task_uuid`, `task_text`), not from a `task_catalog.yaml` file** — every episode carries its own `task_uuid` / `task_text` / `task_catalog_version`, so the converter needs no external catalog and cannot drift from one. (The `ml_data` copy of `task_catalog.yaml` no longer exists; the surviving copy is `<industrialnext-ai-repo>/config/manipulation/semihumanoid/task_catalog.yaml`, useful only for cross-checking.)
   - Acceptance: assert every episode's `task_catalog_version` is `2026-08-16`, and that the set of distinct `(task_uuid, task_text)` pairs has exactly 3 members matching the catalog copy.
 - [x] **1.10** `meta/episodes.jsonl` — `{"episode_index", "tasks": [task_text], "length"}` where `length` is the exact parquet row count.
 - [x] **1.11** `meta/info.json`. **This file is load-bearing in two specific ways — get it wrong and failures are silent:**
@@ -672,14 +673,14 @@ All line numbers below were verified against the working tree at commit `376ba89
 ### Phase 5 — Finetune
 - [ ] **5.1** Launch (paths joined by `:`; `os.pathsep` per `launch_finetune.py:59`):
   ```bash
-  OUT=~/ml_data/data/training_data/gr00t/semihumanoid_260818
+  OUT=data/training_data/gr00t/semihumanoid_260818
   uv run torchrun --nproc_per_node=4 --master_port=29500 \
     gr00t/experiment/launch_finetune.py \
     --base-model-path nvidia/GR00T-N1.7-3B \
     --dataset-path "$OUT/matcha_v2:$OUT/matcha_v3:$OUT/ube_v1:$OUT/ube_v2:$OUT/ube_v3" \
     --embodiment-tag NEW_EMBODIMENT \
     --modality-config-path examples/semihumanoid/semihumanoid_config.py \
-    --num-gpus 4 --output-dir ~/ml_data/runs/gr00t_semihumanoid_260818 \
+    --num-gpus 4 --output-dir outputs/gr00t/gr00t_semihumanoid_260818 \
     --max-steps 30000 --save-steps 2500 --save-total-limit 5 \
     --global-batch-size 32 --dataloader-num-workers 4 \
     --learning-rate 1e-4 --warmup-ratio 0.05 --weight-decay 1e-5 \
@@ -736,25 +737,29 @@ All line numbers below were verified against the working tree at commit `376ba89
     --dataset-path $OUT/ube_v2 --embodiment-tag NEW_EMBODIMENT \
     --model-path <ckpt> --traj-ids 0 1 2 --execution-horizon 40 --steps 400 \
     --modality-keys left_eef left_gripper right_eef right_gripper \
-    --save-plot-path ~/ml_data/runs/gr00t_semihumanoid_260818/olp
+    --save-plot-path outputs/gr00t/gr00t_semihumanoid_260818/olp
   ```
   Note there is deliberately **no `--modality-config-path`** here: `open_loop_eval.py`
   has no such flag and instead reads the modality config back out of the checkpoint's
   saved processor (`open_loop_eval.py:323`, `policy.get_modality_config()`), which it
   then hands to `LeRobotEpisodeLoader`. So the checkpoint is self-describing for eval.
-  `gr00t/eval/run_gr00t_server.py:71` *does* accept `--modality-config-path` if you ever
-  need to override it at serve time.
+  Model serving also reads the modality config from the saved processor. Although
+  `run_gr00t_server.py` exposes `--modality-config-path`, that option applies only to its
+  replay-policy branch and does not override a model checkpoint. See
+  [`2026_0819_semihumanoid_gr00t_model_serving.md`](2026_0819_semihumanoid_gr00t_model_serving.md).
   `--execution-horizon 40` is the maximum permitted value (the contract requires
   `1 <= n_action_steps <= action_horizon`, and our chunk length is 40); use a smaller
   value to re-plan more often.
 - [ ] **6.2** Record MSE/MAE per checkpoint (2500…30000) and confirm a monotone decrease, per the repo's own guidance.
-- [ ] **6.3** Document the **deployment inverse transform**: GR00T emits rot6d in
+- [x] **6.3** Document the **deployment inverse transform**: GR00T emits rot6d in
   row-major convention; before sending to the Flexiv controller, rebuild R via
   GR00T's `_rot6d_to_matrix` and re-encode with the internal column convention
-  (`concat([R[:,0], R[:,1]])`). Omitting this inverts the commanded rotation. (R1)
-- [ ] **6.4** Note that GR00T consumes only the current frame (no 20-step state
+  (`concat([R[:,0], R[:,1]])`). Omitting this inverts the commanded rotation. This is
+  covered by the model-serving guide linked above. (R1)
+- [x] **6.4** Note that GR00T consumes only the current frame (no 20-step state
   history) and predicts 40 steps at 50 Hz — matching the internal `n_action_steps`,
-  so the existing action-execution logic transfers unchanged.
+  so the existing action-execution logic transfers unchanged. The serving guide records
+  the resulting observation contract and receding-horizon execution flow.
 - [ ] **6.5** **Evaluate on the held-out `<subset>_val/` datasets** created in 3.5 and
   report train-vs-held-out MSE/MAE side by side. This is the only number in the plan
   that speaks to generalization; 6.1–6.2 alone measure training-set fit. A large gap
@@ -794,7 +799,8 @@ CUDA_VISIBLE_DEVICES=0 uv run python gr00t/experiment/launch_finetune.py \
   --base-model-path nvidia/GR00T-N1.7-3B --dataset-path <ds> \
   --embodiment-tag NEW_EMBODIMENT \
   --modality-config-path examples/semihumanoid/semihumanoid_config.py \
-  --num-gpus 1 --output-dir /tmp/semi_smoke --max-steps 100 --global-batch-size 8
+  --num-gpus 1 --output-dir outputs/gr00t/semihumanoid_smoke \
+  --max-steps 100 --global-batch-size 8
 ```
 
 ---

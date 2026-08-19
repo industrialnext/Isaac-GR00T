@@ -107,14 +107,14 @@ key would change the training tensors; unknown keys elsewhere are warnings.
 name: semihumanoid
 
 source:
-  root: ~/ml_data/data/training_data/semihumanoid
+  root: data/training_data/semihumanoid
   subsets: ["flexiv_*"]
   episode_glob: "*/20*/*/*/*/episode.h5"
   exclude_path_contains: ["_failed_recordings"]
   fps: 50
 
 output:
-  root: ~/ml_data/data/training_data/gr00t/semihumanoid_260818
+  root: data/training_data/gr00t/semihumanoid_260818
   robot_type: semihumanoid_bimanual
   strip_subset_prefix: "flexiv_"
   val_every: 20                    # deterministic path-based split; 0 disables validation
@@ -190,7 +190,7 @@ continuity:
 
 train:
   base_model: nvidia/GR00T-N1.7-3B
-  out_base: ~/ml_data/outputs/gr00t
+  out_base: outputs/gr00t
   gpus: 4
   batch: 256
   epochs: 2.2                       # max_steps may be supplied instead
@@ -514,7 +514,7 @@ to record action representation, output/chunk, and video-format values that must
 internally consistent across future appends.
 
 The small pre-migration ledger/meta backup is outside the working output root at
-`~/ml_data/data/training_data/gr00t/semihumanoid_260818_metadata_backup_20260819T070503Z`.
+`data/training_data/gr00t/semihumanoid_260818_metadata_backup_20260819T070503Z`.
 The generalized pipeline neither reads nor writes the pre-existing legacy `manifest.json`;
 it remains an inert artifact rather than an admission contract.
 
