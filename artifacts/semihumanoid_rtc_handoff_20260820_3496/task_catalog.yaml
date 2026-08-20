@@ -1,0 +1,13 @@
+schema_version: 1
+task_family: flexiv_ube
+catalog_version: "2026-08-16"
+tasks:
+  - task_uuid: generic_pick
+    task_text: Pick the grounded target object and hold it securely in the gripper.
+    display_name: Generic pick
+  - task_uuid: generic_place
+    task_text: Place the currently held object at the grounded destination and release it.
+    display_name: Generic place
+  - task_uuid: bracket_handover
+    task_text: Hand over the bracket from the gripper holding it to the opposite gripper and secure it in the receiving gripper.
+    display_name: Bracket handover

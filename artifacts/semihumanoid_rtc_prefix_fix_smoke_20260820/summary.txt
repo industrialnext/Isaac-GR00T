@@ -1,0 +1,6 @@
+Industrial Next RTC benchmark
+checkpoint: /mnt/data/ml_data/outputs/gr00t/semihumanoid_20260819_230043/checkpoint-3496
+held-out replay:
+off/trajectory-0: mse=0.00144163 mae=0.00743514 coverage=0.9600 hold=0.0000 rejections=0 prefix_position_max=nan prefix_orientation_max=nan prefix_gripper_max=nan seam_position_p99=0.0234754 seam_orientation_p99=0.0282616 seam_gripper_p99=0.632725 step_position_max=0.00577165 step_orientation_max=0.0118048 step_gripper_max=0.303711 second_position_max=0.00833471 second_gripper_max=0.416992
+native/trajectory-0: mse=5.09295e-05 mae=0.00431393 coverage=0.9600 hold=0.0000 rejections=0 prefix_position_max=0 prefix_orientation_max=2.98023e-08 prefix_gripper_max=0 seam_position_p99=0.0111608 seam_orientation_p99=0.0126331 seam_gripper_p99=0.00501953 step_position_max=0.00925921 step_orientation_max=0.0118096 step_gripper_max=0.292969 second_position_max=0.0112755 second_gripper_max=0.489258
+trained_prefix/trajectory-0: mse=0.0010737 mae=0.0214215 coverage=0.9600 hold=0.0000 rejections=0 prefix_position_max=0 prefix_orientation_max=2.98023e-08 prefix_gripper_max=0 seam_position_p99=0.0365799 seam_orientation_p99=0.0462474 seam_gripper_p99=0.0680664 step_position_max=0.0383156 step_orientation_max=0.0452113 step_gripper_max=0.0898438 second_position_max=0.0455233 second_gripper_max=0.113281

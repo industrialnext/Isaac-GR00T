@@ -281,10 +281,50 @@ def test_cli_safety_gate_and_lightweight_provenance(tmp_path: Path) -> None:
             )
         )
 
+    (model_path / "config.json").write_text(
+        json.dumps({"model_type": "Gr00tN1d7", "action_horizon": 40}),
+        encoding="utf-8",
+    )
+    native = ServerConfig(
+        model_path=str(model_path),
+        task_catalog_path=str(catalog_path),
+        rtc_mode="native",
+    )
+    assert validate_server_config(native) == (model_path.resolve(), catalog_path.resolve())
+    with pytest.raises(ValueError, match="does not advertise"):
+        validate_server_config(
+            ServerConfig(
+                model_path=str(model_path),
+                task_catalog_path=str(catalog_path),
+                rtc_mode="trained_prefix",
+            )
+        )
+    (model_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "Gr00tN1d7",
+                "action_horizon": 40,
+                "rtc_training_max_prefix_steps": 4,
+            }
+        ),
+        encoding="utf-8",
+    )
+    trained = ServerConfig(
+        model_path=str(model_path),
+        task_catalog_path=str(catalog_path),
+        rtc_mode="trained_prefix",
+        rtc_max_prefix_steps=4,
+    )
+    assert validate_server_config(trained) == (model_path.resolve(), catalog_path.resolve())
+
     provenance = build_service_provenance(model_path)
     assert provenance["model_path"] == str(model_path.resolve())
     assert provenance["model_shards"] == [
-        {"name": "model-00001-of-00001.safetensors", "size_bytes": 7}
+        {
+            "name": "model-00001-of-00001.safetensors",
+            "size_bytes": 7,
+            "sha256": "9a129038d9a00aed0cf6a7ea059ca50a813449061ab87848cf1a13eafdf33b2c",
+        }
     ]
     assert len(provenance["model_index_sha256"]) == 64
     assert len(provenance["processor_config_sha256"]) == 64

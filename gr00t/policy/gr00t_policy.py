@@ -21,6 +21,7 @@ This module provides the core policy classes for running Gr00t models:
 """
 
 from pathlib import Path
+import time
 from typing import Any
 
 import numpy as np
@@ -65,6 +66,34 @@ def _sim_language_batch_to_sequence(value: Any) -> Any:
     if isinstance(value, str):
         return [value]
     return value
+
+
+def _restore_physical_hard_prefix(
+    action: dict[str, np.ndarray], options: dict[str, Any] | None
+) -> int:
+    """Restore committed physical rows after the bfloat16 model/decode path.
+
+    RTC hard-prefix rows are not model predictions. Reapplying the already validated
+    physical values prevents bfloat16 quantization of large normalized relative actions
+    from moving a supposedly immutable prefix. Native RTC restores only its frozen rows;
+    the ramp and generated tail remain untouched.
+    """
+    request = {} if options is None else options
+    mode = request.get("rtc_mode", "off")
+    if mode == "trained_prefix":
+        hard_steps = request["rtc_prefix_steps"]
+    elif mode == "native":
+        hard_steps = request["rtc_frozen_steps"]
+    else:
+        return 0
+    if hard_steps == 0:
+        return 0
+
+    physical_prefix = request["action_prefix"]
+    for key, target in action.items():
+        source = np.asarray(physical_prefix[key], dtype=np.float32)
+        np.copyto(target[:, :hard_steps], source[:, :hard_steps])
+    return hard_steps
 
 
 class Gr00tPolicy(BasePolicy):
@@ -173,6 +202,152 @@ class Gr00tPolicy(BasePolicy):
         assert len(language_keys) >= 1, "At least one language key is required"
         assert len(language_delta_indices) == 1, "Only one language delta index is supported"
         self.language_key = language_keys[0]
+
+    def _normalize_action_prefix(
+        self,
+        action_prefix: Any,
+        states: list[dict[str, np.ndarray]],
+    ) -> tuple[torch.Tensor, int]:
+        """Re-anchor an absolute physical prefix at the current observation state."""
+        action_config = self.modality_configs["action"]
+        action_keys = action_config.modality_keys
+        if not isinstance(action_prefix, dict) or set(action_prefix) != set(action_keys):
+            actual = (
+                sorted(action_prefix) if isinstance(action_prefix, dict) else type(action_prefix)
+            )
+            raise ValueError(
+                f"action_prefix keys differ: expected {sorted(action_keys)}, got {actual}"
+            )
+
+        batch_size = len(states)
+        horizon = len(action_config.delta_indices)
+        arrays: dict[str, np.ndarray] = {}
+        prefix_steps: int | None = None
+        norm_params = self.processor.state_action_processor.norm_params[self.embodiment_tag.value][
+            "action"
+        ]
+        for key in action_keys:
+            value = action_prefix[key]
+            if not isinstance(value, np.ndarray) or not np.issubdtype(value.dtype, np.number):
+                raise ValueError(f"action_prefix[{key!r}] must be a numeric numpy array")
+            expected_dim = int(norm_params[key]["dim"].item())
+            if value.ndim != 3 or value.shape[0] != batch_size or value.shape[2] != expected_dim:
+                raise ValueError(
+                    f"action_prefix[{key!r}] must have shape ({batch_size}, O, "
+                    f"{expected_dim}), got {value.shape}"
+                )
+            if not np.isfinite(value).all():
+                raise ValueError(f"action_prefix[{key!r}] contains non-finite values")
+            if prefix_steps is None:
+                prefix_steps = value.shape[1]
+            elif value.shape[1] != prefix_steps:
+                raise ValueError("all action_prefix fields must have the same horizon")
+            arrays[key] = value.astype(np.float32, copy=False)
+
+        assert prefix_steps is not None
+        if not 1 <= prefix_steps <= horizon:
+            raise ValueError(f"action_prefix horizon must be in 1..{horizon}, got {prefix_steps}")
+
+        normalized_batches: list[np.ndarray] = []
+        for batch_index, state in enumerate(states):
+            scratch = {}
+            for key in action_keys:
+                prefix = arrays[key][batch_index]
+                suffix = np.repeat(prefix[-1:], horizon - prefix_steps, axis=0)
+                scratch[key] = np.concatenate((prefix, suffix), axis=0)
+            normalized = self.processor.state_action_processor.apply_action(
+                scratch,
+                self.embodiment_tag.value,
+                state=state,
+                clip_outliers=False,
+            )
+            packed = np.concatenate([normalized[key] for key in action_keys], axis=-1)
+            if packed.shape[1] > self.processor.max_action_dim:
+                raise ValueError(
+                    f"physical action dimension {packed.shape[1]} exceeds processor maximum "
+                    f"{self.processor.max_action_dim}"
+                )
+            packed = np.pad(
+                packed,
+                ((0, 0), (0, self.processor.max_action_dim - packed.shape[1])),
+            )
+            normalized_batches.append(packed[:prefix_steps].astype(np.float32, copy=False))
+        return torch.from_numpy(np.stack(normalized_batches)), prefix_steps
+
+    def _prepare_rtc_request(
+        self,
+        options: dict[str, Any] | None,
+        states: list[dict[str, np.ndarray]],
+    ) -> tuple[torch.Tensor | None, dict[str, Any], dict[str, Any]]:
+        request = {} if options is None else dict(options)
+        mode = request.get("rtc_mode", "off")
+        if mode not in {"off", "native", "trained_prefix"}:
+            raise ValueError(f"Unsupported rtc_mode: {mode!r}")
+        if mode == "off":
+            unexpected = set(request) - {"rtc_mode"}
+            if unexpected:
+                raise ValueError(f"rtc_mode='off' received unsupported options: {unexpected}")
+            return None, {"rtc_mode": "off"}, {"rtc_mode": "off", "prefix_steps": 0}
+
+        if "action_prefix" not in request:
+            raise ValueError(f"rtc_mode={mode!r} requires action_prefix")
+        normalized_prefix, prefix_steps = self._normalize_action_prefix(
+            request["action_prefix"], states
+        )
+        horizon = len(self.modality_configs["action"].delta_indices)
+        packed = torch.zeros(
+            normalized_prefix.shape[0],
+            horizon,
+            self.processor.max_action_dim,
+            dtype=normalized_prefix.dtype,
+        )
+
+        if mode == "native":
+            allowed = {
+                "rtc_mode",
+                "action_prefix",
+                "rtc_frozen_steps",
+                "rtc_overlap_steps",
+                "rtc_ramp_rate",
+            }
+            unexpected = set(request) - allowed
+            if unexpected:
+                raise ValueError(f"rtc_mode='native' received unsupported options: {unexpected}")
+            overlap_steps = request.get("rtc_overlap_steps")
+            if overlap_steps != prefix_steps:
+                raise ValueError(
+                    "native action_prefix horizon must equal rtc_overlap_steps, got "
+                    f"{prefix_steps} and {overlap_steps}"
+                )
+            packed[:, horizon - prefix_steps : horizon] = normalized_prefix
+            model_options = {
+                "rtc_mode": mode,
+                "action_horizon": horizon,
+                "rtc_overlap_steps": overlap_steps,
+                "rtc_frozen_steps": request.get("rtc_frozen_steps"),
+                "rtc_ramp_rate": request.get("rtc_ramp_rate"),
+            }
+        else:
+            allowed = {"rtc_mode", "action_prefix", "rtc_prefix_steps"}
+            unexpected = set(request) - allowed
+            if unexpected:
+                raise ValueError(
+                    f"rtc_mode='trained_prefix' received unsupported options: {unexpected}"
+                )
+            if request.get("rtc_prefix_steps") != prefix_steps:
+                raise ValueError(
+                    "trained action_prefix horizon must equal rtc_prefix_steps, got "
+                    f"{prefix_steps} and {request.get('rtc_prefix_steps')}"
+                )
+            trained_max = int(getattr(self.model.config, "rtc_training_max_prefix_steps", 0))
+            if trained_max <= 0 or prefix_steps > trained_max:
+                raise ValueError(
+                    f"checkpoint trained-prefix maximum is {trained_max}, requested {prefix_steps}"
+                )
+            packed[:, :prefix_steps] = normalized_prefix
+            model_options = {"rtc_mode": mode, "rtc_prefix_steps": prefix_steps}
+
+        return packed, model_options, {"rtc_mode": mode, "prefix_steps": prefix_steps}
 
     def _unbatch_observation(self, value: dict[str, Any]) -> list[dict[str, Any]]:
         """Unbatch a batched observation into a list of single observations.
@@ -391,12 +566,14 @@ class Gr00tPolicy(BasePolicy):
 
         Args:
             observation: Batched observation dictionary
-            options: Optional parameters (currently unused)
+            options: Validated RTC request. Physical action prefixes are absolute and are
+                re-anchored against this observation before model inference.
 
         Returns:
             Tuple of (actions_dict, info_dict)
         """
         # Step 1: Split batched observation into individual observations
+        started_at = time.perf_counter()
         unbatched_observations = self._unbatch_observation(observation)
         processed_inputs = []
 
@@ -408,16 +585,25 @@ class Gr00tPolicy(BasePolicy):
             messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
             processed_inputs.append(self.processor(messages))
 
+        normalized_prefix, model_options, rtc_info = self._prepare_rtc_request(options, states)
+        if normalized_prefix is not None:
+            for item, prefix in zip(processed_inputs, normalized_prefix):
+                item["action"] = prefix
+
         # Step 3: Collate processed inputs into a single batch for model
         collated_inputs = self.collate_fn(processed_inputs)
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
+        preprocessing_ms = (time.perf_counter() - started_at) * 1000.0
 
         # Step 4: Run model inference to predict actions
+        generation_started_at = time.perf_counter()
         with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+            model_pred = self.model.get_action(**collated_inputs, options=model_options)
         normalized_action = model_pred["action_pred"].float()
+        generation_ms = (time.perf_counter() - generation_started_at) * 1000.0
 
         # Step 5: Decode actions from normalized space back to physical units
+        decode_started_at = time.perf_counter()
         batched_states = {}
         for k in self.modality_configs["state"].modality_keys:
             batched_states[k] = np.stack([s[k] for s in states], axis=0)  # (B, T, D)
@@ -429,7 +615,17 @@ class Gr00tPolicy(BasePolicy):
         casted_action = {
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
-        return casted_action, {}
+        restored_steps = _restore_physical_hard_prefix(casted_action, options)
+        rtc_info.update(
+            {
+                "physical_prefix_restored_steps": restored_steps,
+                "preprocessing_ms": preprocessing_ms,
+                "generation_ms": generation_ms,
+                "decode_ms": (time.perf_counter() - decode_started_at) * 1000.0,
+                "total_ms": (time.perf_counter() - started_at) * 1000.0,
+            }
+        )
+        return casted_action, rtc_info
 
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.

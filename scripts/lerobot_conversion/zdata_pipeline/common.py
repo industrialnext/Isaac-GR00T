@@ -9,6 +9,17 @@ from pathlib import Path
 
 
 STATS_FILES = ("stats.json", "relative_stats.json")
+FROZEN_CORPUS_MANIFEST = "_frozen_corpus_manifest.json"
+
+
+def frozen_corpus_manifest_path(output_root: Path) -> Path:
+    return output_root / FROZEN_CORPUS_MANIFEST
+
+
+def assert_output_mutable(output_root: Path) -> None:
+    manifest_path = frozen_corpus_manifest_path(output_root)
+    if manifest_path.exists():
+        raise RuntimeError(f"converted corpus is frozen by {manifest_path}; use a new output root")
 
 
 def transaction_journals(output_root: Path) -> list[Path]:

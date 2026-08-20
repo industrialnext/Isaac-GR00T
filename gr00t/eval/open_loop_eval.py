@@ -15,6 +15,7 @@
 
 from copy import deepcopy
 from dataclasses import dataclass, field
+import json
 import logging
 from pathlib import Path
 import re
@@ -26,6 +27,7 @@ from gr00t.data.dataset.sharded_single_step_dataset import extract_step_data
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.utils import parse_observation_gr00t
 from gr00t.eval._horizon_contract import PolicyHorizonSpec, migrate_deprecated_action_horizon_argv
+from gr00t.eval.run_gr00t_industrialnext_server import build_service_provenance
 from gr00t.policy import BasePolicy
 from gr00t.policy.gr00t_policy import Gr00tPolicy
 from gr00t.policy.server_client import PolicyClient
@@ -131,6 +133,15 @@ def plot_trajectory_results(
 def parse_action_gr00t(action: dict[str, Any]) -> dict[str, Any]:
     # Unbatch and add prefix
     return {f"action.{key}": action[key][0] for key in action}
+
+
+def _trajectory_plot_path(
+    configured_path: str | None, trajectory_id: int, *, multiple_trajectories: bool
+) -> str | None:
+    if configured_path is None or not multiple_trajectories:
+        return configured_path
+    path = Path(configured_path)
+    return str(path.with_name(f"{path.stem}_traj_{trajectory_id}{path.suffix}"))
 
 
 def evaluate_single_trajectory(
@@ -272,6 +283,9 @@ class ArgsConfig:
     modality_keys: list[str] | None = None
     """List of modality keys to plot. If None, plot all keys."""
 
+    output_json_path: str | None = None
+    """Optional path for a machine-readable evaluation report."""
+
 
 def main(args: ArgsConfig):
     args.embodiment_tag = EmbodimentTag.resolve(args.embodiment_tag)
@@ -334,10 +348,12 @@ def main(args: ArgsConfig):
 
     all_mse = []
     all_mae = []
+    trajectory_results: dict[str, dict[str, float | str]] = {}
 
     for traj_id in args.traj_ids:
         if traj_id >= len(dataset):
             logging.warning(f"Trajectory ID {traj_id} is out of range. Skipping.")
+            trajectory_results[str(traj_id)] = {"status": "trajectory_out_of_range"}
             continue
 
         logging.info(f"Running trajectory: {traj_id}")
@@ -349,20 +365,62 @@ def main(args: ArgsConfig):
             args.modality_keys,
             steps=args.steps,
             execution_horizon=args.execution_horizon,
-            save_plot_path=args.save_plot_path,
+            save_plot_path=_trajectory_plot_path(
+                args.save_plot_path,
+                traj_id,
+                multiple_trajectories=len(args.traj_ids) > 1,
+            ),
         )
         logging.info(f"MSE for trajectory {traj_id}: {mse}, MAE: {mae}")
+        mse = float(mse)
+        mae = float(mae)
+        trajectory_results[str(traj_id)] = {"status": "ok", "mse": mse, "mae": mae}
         all_mse.append(mse)
         all_mae.append(mae)
 
+    avg_mse = None
+    avg_mae = None
     if all_mse:
-        avg_mse = np.mean(np.array(all_mse))
-        avg_mae = np.mean(np.array(all_mae))
+        avg_mse = float(np.mean(np.array(all_mse)))
+        avg_mae = float(np.mean(np.array(all_mae)))
         logging.info(f"Average MSE across all trajs: {avg_mse}")
         logging.info(f"Average MAE across all trajs: {avg_mae}")
     else:
         logging.info("No valid trajectories were evaluated.")
+    report = {
+        "schema_version": 1,
+        "model_path": local_model_path,
+        "global_step": global_step,
+        "provenance": (
+            build_service_provenance(Path(local_model_path))
+            if local_model_path is not None
+            else None
+        ),
+        "config": {
+            "dataset_path": args.dataset_path,
+            "embodiment_tag": args.embodiment_tag.value,
+            "steps": args.steps,
+            "trajectory_ids": args.traj_ids,
+            "execution_horizon": args.execution_horizon,
+            "denoising_steps": args.denoising_steps,
+            "modality_keys": args.modality_keys,
+        },
+        "trajectories": trajectory_results,
+        "average_mse": avg_mse,
+        "average_mae": avg_mae,
+    }
+    if args.output_json_path is not None:
+        output_path = Path(args.output_json_path).expanduser().resolve()
+        if output_path.exists():
+            raise FileExistsError(f"evaluation report already exists: {output_path}")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        logging.info(f"Saved evaluation report to {output_path}")
     logging.info("Done")
+    return report
 
 
 if __name__ == "__main__":

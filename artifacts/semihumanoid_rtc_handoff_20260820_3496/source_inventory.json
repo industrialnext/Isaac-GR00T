@@ -1,0 +1,15 @@
+{
+  "artifacts_excluded_from_source_patch": true,
+  "industrialnext_rpc_revision": "c3dc583ee36310581ad1ec154559698051988b9f",
+  "repository_patch_sha256": "29eda1a495f1044fbbd1f1e2a8a9f784a3809f666c25eb08d72d9c2914b047c3",
+  "repository_revision": "709a031151f58a904a7083d3957140822632d371",
+  "schema_version": 1,
+  "training_launch_dirty_diff_sha256": "5231b762a6cd0a76ee8f064261ce677d2eb5cd486794499587e56b6d6e06e238",
+  "training_launch_repository_revision": "709a031151f58a904a7083d3957140822632d371",
+  "untracked_source_paths_in_patch": [
+    "gr00t/eval/benchmark_industrialnext_rtc.py",
+    "gr00t/eval/smoke_industrialnext_loopback.py",
+    "scripts/deployment/build_semihumanoid_rtc_handoff.py",
+    "tests/gr00t/eval/test_benchmark_industrialnext_rtc.py"
+  ]
+}

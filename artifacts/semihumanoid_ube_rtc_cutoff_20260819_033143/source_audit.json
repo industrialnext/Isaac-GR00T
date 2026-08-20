@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "audit_date_utc": "2026-08-19",
+  "admission_status": "admitted",
+  "cutoff_utc": "2026-08-19T03:31:43.248813196Z",
+  "source_inventory": {
+    "included_subsets": [
+      "flexiv_ube_v1",
+      "flexiv_ube_v2",
+      "flexiv_ube_v3",
+      "flexiv_ube_v4"
+    ],
+    "episode_files": 1339,
+    "matching_passes": 2,
+    "stat_inventory_sha256": "3e909412cea6681e1aa9ae613e085c8dbaa8ac9791afd4e1feeec71e0292c92b",
+    "open_episode_files_at_cutoff": 0
+  },
+  "producer_contract": {
+    "action_rows": "observed state paired with authoritative absolute commanded action",
+    "action_ownership": "both arms and both grippers",
+    "head_camera": "fixed for every admitted Ube release",
+    "task_catalog_version": "2026-08-16",
+    "qc_authority": "explicit valid_for_training=true is required on every episode",
+    "evidence": [
+      "industrialnext_ai/docs/training/2026_0806_unified_deft_pretraining_dataset_design.md",
+      "docs/2026_0818_semihumanoid_gr00t_conversion_plan.md"
+    ],
+    "v4_release_binding": "The updated conversion audit records Ube v4 as the same 46-state/20-action Ube contract, with all three canonical cameras, zero action residuals, expert policy type, and zero QC drops."
+  },
+  "subsets": {
+    "flexiv_ube_v1": {
+      "episodes": 322,
+      "explicit_valid_for_training_true": 322,
+      "usable_segments": 342,
+      "gap_boundaries_over_40_ms": 262,
+      "short_segments_dropped": 242,
+      "maximum_gap_ms": 133.50,
+      "tasks": {"generic_pick": 172, "generic_place": 150}
+    },
+    "flexiv_ube_v2": {
+      "episodes": 470,
+      "explicit_valid_for_training_true": 470,
+      "usable_segments": 474,
+      "gap_boundaries_over_40_ms": 471,
+      "short_segments_dropped": 467,
+      "maximum_gap_ms": 125.31,
+      "tasks": {"generic_pick": 236, "generic_place": 234}
+    },
+    "flexiv_ube_v3": {
+      "episodes": 212,
+      "explicit_valid_for_training_true": 212,
+      "usable_segments": 216,
+      "gap_boundaries_over_40_ms": 425,
+      "short_segments_dropped": 421,
+      "maximum_gap_ms": 127.30,
+      "tasks": {
+        "generic_pick": 91,
+        "generic_place": 89,
+        "bracket_handover": 32
+      }
+    },
+    "flexiv_ube_v4": {
+      "episodes": 335,
+      "explicit_valid_for_training_true": 335,
+      "usable_segments": 408,
+      "gap_boundaries_over_40_ms": 248,
+      "short_segments_dropped": 175,
+      "maximum_gap_ms": 124.59,
+      "tasks": {
+        "generic_pick": 136,
+        "generic_place": 132,
+        "bracket_handover": 67
+      }
+    }
+  },
+  "qc_warning_disposition": {
+    "frame_gap_over_40_ms": "Every observed boundary is configured as a hard segment break; no 40-step action window may cross it.",
+    "short_segment": "Every resulting segment shorter than the 40-step action horizon is dropped.",
+    "camera_coverage": "zero warnings",
+    "camera_age_p99": "zero warnings",
+    "nonzero_action_residual": "zero warnings",
+    "other": "zero warnings"
+  },
+  "preview": {
+    "full_dry_run_exit_code": 0,
+    "source_records_discovered": 1339,
+    "source_records_accepted": 1339
+  }
+}

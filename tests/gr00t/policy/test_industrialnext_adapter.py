@@ -25,6 +25,7 @@ from gr00t.policy.industrialnext.adapter import (
     build_model_observation,
     build_synthetic_model_observation,
     map_action_chunk,
+    map_wire_action_prefix,
     snapshot_is_fresh,
 )
 from gr00t.policy.industrialnext.task_catalog import load_task_catalog
@@ -335,6 +336,12 @@ def test_action_chunk_maps_absolute_pose_and_passes_grippers_through() -> None:
     assert rows[0]["left_gripper"] == pytest.approx([-0.2])
     assert rows[-1]["left_gripper"] == pytest.approx([1.2])
 
+    round_trip = map_wire_action_prefix(rows[:7])
+    np.testing.assert_allclose(round_trip["left_eef"], left_eef[:, :7], atol=1e-6)
+    np.testing.assert_allclose(round_trip["right_eef"], right_eef[:, :7], atol=1e-6)
+    np.testing.assert_allclose(round_trip["left_gripper"], left_gripper[:, :7], atol=1e-6)
+    np.testing.assert_allclose(round_trip["right_gripper"], right_gripper[:, :7], atol=1e-6)
+
 
 def test_action_chunk_rejects_wrong_shape_nonfinite_and_extra_key() -> None:
     valid = {
@@ -358,6 +365,23 @@ def test_action_chunk_rejects_wrong_shape_nonfinite_and_extra_key() -> None:
 
     with pytest.raises(ValueError, match="keys differ"):
         map_action_chunk(valid | {"extra": np.zeros(1)})
+
+
+def test_wire_action_prefix_rejects_malformed_rows() -> None:
+    valid_row = {
+        "left_arm_pose_pos": [0.0, 0.0, 0.0],
+        "left_arm_pose_rot": IDENTITY_SOURCE_ROT6D,
+        "left_gripper": [0.5],
+        "right_arm_pose_pos": [0.0, 0.0, 0.0],
+        "right_arm_pose_rot": IDENTITY_SOURCE_ROT6D,
+        "right_gripper": [0.5],
+    }
+    with pytest.raises(ValueError, match="non-empty"):
+        map_wire_action_prefix([])
+    with pytest.raises(ValueError, match="fields differ"):
+        map_wire_action_prefix([valid_row | {"extra": [0.0]}])
+    with pytest.raises(ValueError, match="degenerate"):
+        map_wire_action_prefix([valid_row | {"left_arm_pose_rot": [0.0] * 6}])
 
 
 @pytest.mark.parametrize("field_name, width", STATE_FIELD_WIDTHS)

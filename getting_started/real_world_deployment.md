@@ -410,7 +410,12 @@ When direct optimization is insufficient, use one or more of the following:
 
 **Recommended strategy**: `Asynchronous Inference + RTC` is usually the most effective.
 
-> **RTC status (experimental):** Asynchronous inference is supported today. RTC is currently only a low-level model primitive: `action_head.get_action(..., options={"rtc_overlap_steps": ..., "rtc_frozen_steps": ..., "rtc_ramp_rate": ...})` with the previous action fed back in (`gr00t/model/gr00t_n1d7/gr00t_n1d7.py`). It is **not wired into `Gr00tPolicy` or the server-client path** (there `options` is currently unused), and it has no tests or ready-made example — so the RTC steps below require manual integration.
+> **RTC status (experimental):** `Gr00tPolicy` now supports explicit `off`, `native`, and
+> `trained_prefix` requests with absolute physical action prefixes. The Industrial Next async
+> server owns target-timestep alignment, launch-time prefix assembly, delay prediction, and
+> atomic admission. `native` works with compatible N1.7 checkpoints; `trained_prefix` requires
+> a checkpoint whose saved config advertises a positive `rtc_training_max_prefix_steps`.
+> Unsupported checkpoint/mode combinations fail closed.
 
 #### Real-Time Chunking (RTC) Details
 
@@ -446,7 +451,9 @@ In the RTC (Real-Time Chunking) framework, two key parameters control how adjace
 - **`overlap`**: The number of action steps retained from the previous prediction to constrain the current one, ensuring temporal consistency between consecutive chunks.
 - **`frozen`**: The number of steps that remain completely frozen (i.e., not updated by the new prediction), typically set to match the inference latency.
 
-Below is a simplified async inference + RTC loop. Note that official RTC support for GR00T is coming soon; the current implementation may require manual adaptation.
+Below is conceptual scheduling pseudocode. The Industrial Next integration implements these
+operations in `gr00t/policy/industrialnext/async_server.py`; deployments should use its explicit
+configuration, monitoring, and rejection paths instead of copying this simplified loop.
 
 ```
 actions = policy.infer(obs)                        # blocking first call
@@ -460,5 +467,4 @@ loop:
             actions = future.get()                 # swap in next chunk
             break                                  # discard frozen tail
 ```
-
 

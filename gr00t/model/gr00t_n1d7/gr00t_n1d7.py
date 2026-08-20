@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+import math
 from typing import Any, Tuple
 
 import torch
@@ -172,6 +173,88 @@ class Gr00tN1d7ActionHead(nn.Module):
         sample = (1 - sample) * self.config.noise_s
         return sample
 
+    def _validate_rtc_request(
+        self,
+        action_input: BatchFeature,
+        options: dict[str, Any] | None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Validate the model-level RTC contract before sampling any noise."""
+        request = {} if options is None else dict(options)
+        mode = request.get("rtc_mode", "off")
+        if mode not in {"off", "native", "trained_prefix"}:
+            raise ValueError(f"Unsupported rtc_mode: {mode!r}")
+
+        has_action = "action" in action_input
+        if mode == "off":
+            if has_action:
+                raise ValueError("rtc_mode='off' does not accept an action prefix")
+            unexpected = set(request) - {"rtc_mode"}
+            if unexpected:
+                raise ValueError(f"rtc_mode='off' received unsupported options: {unexpected}")
+            return mode, request
+
+        if not has_action:
+            raise ValueError(f"rtc_mode={mode!r} requires an action prefix tensor")
+        prefix = action_input["action"]
+        if prefix.ndim != 3 or prefix.shape[1] > self.action_horizon:
+            raise ValueError(
+                "RTC action input must have shape (B, T, D) with T no larger than the "
+                f"model horizon {self.action_horizon}, got {tuple(prefix.shape)}"
+            )
+        if prefix.shape[-1] != self.action_dim or not torch.isfinite(prefix).all():
+            raise ValueError("RTC action input has an invalid action dimension or non-finite value")
+
+        def _required_int(name: str) -> int:
+            value = request.get(name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an integer")
+            return value
+
+        if mode == "native":
+            allowed = {
+                "rtc_mode",
+                "action_horizon",
+                "rtc_overlap_steps",
+                "rtc_frozen_steps",
+                "rtc_ramp_rate",
+            }
+            unexpected = set(request) - allowed
+            if unexpected:
+                raise ValueError(f"rtc_mode='native' received unsupported options: {unexpected}")
+            action_horizon = _required_int("action_horizon")
+            overlap_steps = _required_int("rtc_overlap_steps")
+            frozen_steps = _required_int("rtc_frozen_steps")
+            if not 0 <= frozen_steps <= overlap_steps <= action_horizon <= prefix.shape[1]:
+                raise ValueError(
+                    "native RTC requires 0 <= frozen <= overlap <= action_horizon <= "
+                    "the supplied action tensor horizon"
+                )
+            ramp_rate = request.get("rtc_ramp_rate")
+            if isinstance(ramp_rate, bool) or not isinstance(ramp_rate, (int, float)):
+                raise ValueError("rtc_ramp_rate must be a finite positive number")
+            if not math.isfinite(float(ramp_rate)) or float(ramp_rate) <= 0:
+                raise ValueError("rtc_ramp_rate must be a finite positive number")
+            return mode, request
+
+        allowed = {"rtc_mode", "rtc_prefix_steps"}
+        unexpected = set(request) - allowed
+        if unexpected:
+            raise ValueError(
+                f"rtc_mode='trained_prefix' received unsupported options: {unexpected}"
+            )
+        prefix_steps = _required_int("rtc_prefix_steps")
+        trained_max = self.config.rtc_training_max_prefix_steps
+        if trained_max <= 0:
+            raise ValueError("This checkpoint was not trained for trained_prefix RTC")
+        if not 1 <= prefix_steps <= trained_max:
+            raise ValueError(
+                f"rtc_prefix_steps must be in 1..{trained_max} for this checkpoint, got "
+                f"{prefix_steps}"
+            )
+        if prefix_steps > prefix.shape[1]:
+            raise ValueError("rtc_prefix_steps exceeds the supplied action prefix")
+        return mode, request
+
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
         backbone_features = self.vlln(backbone_features)
@@ -228,14 +311,33 @@ class Gr00tN1d7ActionHead(nn.Module):
         # Embed noised action trajectory.
         actions = action_input.action
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
-        t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
-        t = t[:, None, None]  # shape (B,1,1) for broadcast
-
-        noisy_trajectory = (1 - t) * noise + t * actions
+        sampled_t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
+        max_prefix_steps = self.config.rtc_training_max_prefix_steps
+        if max_prefix_steps == 0:
+            t = sampled_t[:, None, None]  # shape (B,1,1) for broadcast
+            noisy_trajectory = (1 - t) * noise + t * actions
+            t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
+            model_timesteps = t_discretized
+            prefix_lengths = torch.zeros(actions.shape[0], dtype=torch.long, device=actions.device)
+        else:
+            prefix_lengths = torch.randint(
+                0,
+                max_prefix_steps + 1,
+                (actions.shape[0],),
+                device=actions.device,
+            )
+            token_ids = torch.arange(actions.shape[1], device=actions.device)[None, :]
+            prefix_mask = token_ids < prefix_lengths[:, None]
+            action_times = sampled_t[:, None].expand(-1, actions.shape[1]).clone()
+            action_times[prefix_mask] = 1.0
+            noisy_trajectory = (1 - action_times[:, :, None]) * noise + action_times[
+                :, :, None
+            ] * actions
+            t_discretized = (action_times * self.num_timestep_buckets).long()
+            state_timestep = (sampled_t * self.num_timestep_buckets).long()[:, None]
+            model_timesteps = torch.cat((state_timestep, t_discretized), dim=1)
         velocity = actions - noise
 
-        # Convert (continuous) t -> discrete if needed
-        t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
         action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
 
         # Maybe add position embedding.
@@ -255,7 +357,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
                 encoder_attention_mask=vl_attn_mask,
-                timestep=t_discretized,
+                timestep=model_timesteps,
                 return_all_hidden_states=True,
                 image_mask=image_mask,
                 backbone_attention_mask=backbone_attention_mask,
@@ -265,7 +367,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
                 encoder_attention_mask=vl_attn_mask,
-                timestep=t_discretized,
+                timestep=model_timesteps,
                 return_all_hidden_states=True,
             )
 
@@ -274,6 +376,9 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
+        if max_prefix_steps > 0:
+            postfix_mask = ~prefix_mask[:, :, None]
+            action_mask = action_mask * postfix_mask.to(dtype=action_mask.dtype)
         action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = action_loss.sum() / (action_mask.sum() + 1e-6)
 
@@ -281,6 +386,8 @@ class Gr00tN1d7ActionHead(nn.Module):
             "loss": loss,
             "action_loss": action_loss,
             "action_mask": action_mask,
+            "rtc_prefix_lengths": prefix_lengths.detach(),
+            "rtc_postfix_valid_elements": action_mask.sum().detach(),
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }
@@ -343,6 +450,8 @@ class Gr00tN1d7ActionHead(nn.Module):
         """
         vl_embeds = backbone_features
 
+        rtc_mode, rtc_options = self._validate_rtc_request(action_input, options)
+
         # Set initial actions as the sampled noise.
         batch_size = vl_embeds.shape[0]
         device = vl_embeds.device
@@ -355,33 +464,28 @@ class Gr00tN1d7ActionHead(nn.Module):
         dt = 1.0 / self.num_inference_timesteps
         vel_strength = torch.ones_like(actions)
 
-        if "action" in action_input:
+        hard_prefix = None
+        if rtc_mode == "native":
             # If action in input when doing get action, it means we want to use RTC.
             # action_horizon is the action horizon of the input action.
             # rtc_overlap_steps is the number of steps to overlap with the previous action chunks.
             # rtc_frozen_steps is the number of steps to freeze the action, which is the latency of the policy inference.
             # rtc_ramp_rate is the rate of the ramp of denoising the actions.
-            assert options is not None, "options is not None"
-            assert "action_horizon" in options, "action_horizon is not in options"
-            assert "rtc_overlap_steps" in options, "rtc_overlap_steps is not in options"
-            assert "rtc_frozen_steps" in options, "rtc_frozen_steps is not in options"
-            assert "rtc_ramp_rate" in options, "rtc_ramp_rate is not in options"
-
-            action_horizon_before_padding = options["action_horizon"]
+            action_horizon_before_padding = rtc_options["action_horizon"]
 
             # Use previous action instead of pure noise to do inpainting
-            actions[:, : options["rtc_overlap_steps"], :] = action_input["action"][
+            actions[:, : rtc_options["rtc_overlap_steps"], :] = action_input["action"][
                 :,
                 action_horizon_before_padding
-                - options["rtc_overlap_steps"] : action_horizon_before_padding,
+                - rtc_options["rtc_overlap_steps"] : action_horizon_before_padding,
                 :,
             ]
-            vel_strength[:, : options["rtc_frozen_steps"], :] = 0.0
+            vel_strength[:, : rtc_options["rtc_frozen_steps"], :] = 0.0
             # NOTE: use an exponential ramp strength to set the remaining unfrozen rtc_steps
-            intermediate_steps = options["rtc_overlap_steps"] - options["rtc_frozen_steps"]
+            intermediate_steps = rtc_options["rtc_overlap_steps"] - rtc_options["rtc_frozen_steps"]
             # Create exponential ramp from 0 to 1 over intermediate steps
             t = torch.linspace(0.0, 1.0, intermediate_steps + 2, device=device)
-            ramp = 1 - torch.exp(-options["rtc_ramp_rate"] * t)
+            ramp = 1 - torch.exp(-rtc_options["rtc_ramp_rate"] * t)
             ramp = ramp / ramp[-1].clamp_min(1e-8)  # normalize to [0,1]
             ramp = ramp[
                 1:-1
@@ -389,9 +493,15 @@ class Gr00tN1d7ActionHead(nn.Module):
             # Apply ramp to the intermediate steps [batch, intermediate_steps, action_dim]
             vel_strength[
                 :,
-                options["rtc_frozen_steps"] : options["rtc_overlap_steps"],
+                rtc_options["rtc_frozen_steps"] : rtc_options["rtc_overlap_steps"],
                 :,
             ] = ramp[None, :, None].to(device)
+        elif rtc_mode == "trained_prefix":
+            prefix_steps = rtc_options["rtc_prefix_steps"]
+            hard_prefix = action_input["action"][:, :prefix_steps, :].to(
+                device=device, dtype=actions.dtype
+            )
+            actions[:, :prefix_steps, :] = hard_prefix
 
         # Run denoising steps.
         for t in range(self.num_inference_timesteps):
@@ -402,7 +512,16 @@ class Gr00tN1d7ActionHead(nn.Module):
             timesteps_tensor = torch.full(
                 size=(batch_size,), fill_value=t_discretized, device=device
             )
-            action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
+            if rtc_mode == "trained_prefix":
+                prefix_steps = rtc_options["rtc_prefix_steps"]
+                actions[:, :prefix_steps, :] = hard_prefix
+                action_timesteps = timesteps_tensor[:, None].expand(-1, self.action_horizon).clone()
+                action_timesteps[:, :prefix_steps] = self.num_timestep_buckets
+                action_features = self.action_encoder(actions, action_timesteps, embodiment_id)
+                model_timesteps = torch.cat((timesteps_tensor[:, None], action_timesteps), dim=1)
+            else:
+                action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
+                model_timesteps = timesteps_tensor
             # Add position embedding.
             if self.config.add_pos_embed:
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
@@ -417,7 +536,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 model_output = self.model(
                     hidden_states=sa_embs,
                     encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
+                    timestep=model_timesteps,
                     image_mask=backbone_output.image_mask,
                     backbone_attention_mask=backbone_output.backbone_attention_mask,
                 )
@@ -425,7 +544,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 model_output = self.model(
                     hidden_states=sa_embs,
                     encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
+                    timestep=model_timesteps,
                 )
             pred = self.action_decoder(model_output, embodiment_id)
 
@@ -433,6 +552,11 @@ class Gr00tN1d7ActionHead(nn.Module):
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity * vel_strength
+            if hard_prefix is not None:
+                actions[:, : rtc_options["rtc_prefix_steps"], :] = hard_prefix
+
+        if hard_prefix is not None:
+            actions[:, : rtc_options["rtc_prefix_steps"], :] = hard_prefix
 
         return BatchFeature(
             data={

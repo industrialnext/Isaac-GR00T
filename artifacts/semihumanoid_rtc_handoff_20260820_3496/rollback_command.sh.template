@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${RTC_PREVIOUS_LAUNCH_COMMAND:?Record and export the previous launch command first}"
+exec bash -lc "$RTC_PREVIOUS_LAUNCH_COMMAND"

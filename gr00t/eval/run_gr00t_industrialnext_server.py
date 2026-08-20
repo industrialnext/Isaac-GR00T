@@ -78,6 +78,54 @@ class ServerConfig:
     stats_log_interval_steps: int = 250
     """Accepted-step interval for aggregate diagnostics; zero disables periodic logging."""
 
+    rtc_mode: str = "off"
+    """Chunk refresh mode: off, native, or trained_prefix."""
+
+    rtc_initial_frozen_steps: int = 1
+    """Bootstrap committed-prefix estimate before latency history is available."""
+
+    rtc_delay_window_size: int = 20
+    """Number of observed committed-prefix lengths in the rolling maximum."""
+
+    rtc_delay_margin_steps: int = 1
+    """Safety margin added to the rolling maximum committed-prefix length."""
+
+    rtc_max_prefix_steps: int = 24
+    """Hard runtime prefix bound; trained_prefix may not exceed checkpoint training support."""
+
+    rtc_native_overlap_steps: int = 24
+    """Maximum prior-action overlap supplied to the native RTC sampler."""
+
+    rtc_min_new_tail_steps: int = 16
+    """Minimum independently generated postfix rows required per accepted chunk."""
+
+    rtc_ramp_rate: float = 6.0
+    """Exponential velocity-ramp rate used only by native RTC."""
+
+    rtc_position_tolerance: float = 1e-4
+    """Maximum absolute-position hard-prefix round-trip error in meters."""
+
+    rtc_orientation_tolerance_rad: float = 1e-3
+    """Maximum SO(3) hard-prefix round-trip error in radians."""
+
+    rtc_gripper_tolerance: float = 1e-4
+    """Maximum hard-prefix gripper round-trip error."""
+
+    max_position_step_m: float | None = None
+    """Optional fail-closed maximum translation change between adjacent output rows."""
+
+    max_orientation_step_rad: float | None = None
+    """Optional fail-closed maximum SO(3) change between adjacent output rows."""
+
+    max_gripper_step: float | None = None
+    """Optional fail-closed maximum gripper change between adjacent output rows."""
+
+    max_position_second_difference_m: float | None = None
+    """Optional fail-closed position second-finite-difference bound."""
+
+    max_gripper_second_difference: float | None = None
+    """Optional fail-closed gripper second-finite-difference bound."""
+
     allow_unsafe_non_loopback: bool = False
     """Explicitly permit a non-loopback bind despite pickle remote-code-execution risk."""
 
@@ -107,13 +155,30 @@ def validate_server_config(config: ServerConfig) -> tuple[Path, Path]:
         or config.max_message_size_bytes <= 0
     ):
         raise ValueError("max_message_size_bytes must be a positive integer")
-    IndustrialNextServingConfig(
+    serving_config = IndustrialNextServingConfig(
         control_hz=config.control_hz,
         max_image_staleness_steps=config.max_image_staleness_steps,
         min_usable_action_steps=config.min_usable_action_steps,
         idle_session_timeout_s=config.idle_session_timeout_s,
         stats_log_interval_steps=config.stats_log_interval_steps,
+        rtc_mode=config.rtc_mode,
+        rtc_initial_frozen_steps=config.rtc_initial_frozen_steps,
+        rtc_delay_window_size=config.rtc_delay_window_size,
+        rtc_delay_margin_steps=config.rtc_delay_margin_steps,
+        rtc_max_prefix_steps=config.rtc_max_prefix_steps,
+        rtc_native_overlap_steps=config.rtc_native_overlap_steps,
+        rtc_min_new_tail_steps=config.rtc_min_new_tail_steps,
+        rtc_ramp_rate=config.rtc_ramp_rate,
+        rtc_position_tolerance=config.rtc_position_tolerance,
+        rtc_orientation_tolerance_rad=config.rtc_orientation_tolerance_rad,
+        rtc_gripper_tolerance=config.rtc_gripper_tolerance,
+        max_position_step_m=config.max_position_step_m,
+        max_orientation_step_rad=config.max_orientation_step_rad,
+        max_gripper_step=config.max_gripper_step,
+        max_position_second_difference_m=config.max_position_second_difference_m,
+        max_gripper_second_difference=config.max_gripper_second_difference,
     )
+    validate_checkpoint_rtc_compatibility(model_path, serving_config)
     if not _is_loopback_host(config.host):
         if not config.allow_unsafe_non_loopback:
             raise ValueError(
@@ -138,6 +203,22 @@ async def serve_forever(config: ServerConfig) -> None:
         min_usable_action_steps=config.min_usable_action_steps,
         idle_session_timeout_s=config.idle_session_timeout_s,
         stats_log_interval_steps=config.stats_log_interval_steps,
+        rtc_mode=config.rtc_mode,
+        rtc_initial_frozen_steps=config.rtc_initial_frozen_steps,
+        rtc_delay_window_size=config.rtc_delay_window_size,
+        rtc_delay_margin_steps=config.rtc_delay_margin_steps,
+        rtc_max_prefix_steps=config.rtc_max_prefix_steps,
+        rtc_native_overlap_steps=config.rtc_native_overlap_steps,
+        rtc_min_new_tail_steps=config.rtc_min_new_tail_steps,
+        rtc_ramp_rate=config.rtc_ramp_rate,
+        rtc_position_tolerance=config.rtc_position_tolerance,
+        rtc_orientation_tolerance_rad=config.rtc_orientation_tolerance_rad,
+        rtc_gripper_tolerance=config.rtc_gripper_tolerance,
+        max_position_step_m=config.max_position_step_m,
+        max_orientation_step_rad=config.max_orientation_step_rad,
+        max_gripper_step=config.max_gripper_step,
+        max_position_second_difference_m=config.max_position_second_difference_m,
+        max_gripper_second_difference=config.max_gripper_second_difference,
     )
     embodiment_tag = EmbodimentTag.resolve(config.embodiment_tag)
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="groot-inference")
@@ -181,12 +262,13 @@ async def serve_forever(config: ServerConfig) -> None:
             ):
                 logger.info(
                     "Industrial Next GR00T server ready at ws://%s:%d | model=%s | "
-                    "control_hz=%.1f | min_usable_action_steps=%d",
+                    "control_hz=%.1f | min_usable_action_steps=%d | rtc_mode=%s",
                     config.host,
                     config.port,
                     model_path,
                     config.control_hz,
                     config.min_usable_action_steps,
+                    config.rtc_mode,
                 )
                 await stop_event.wait()
         finally:
@@ -203,10 +285,13 @@ def build_service_provenance(model_path: Path) -> dict[str, Any]:
     """Collect lightweight, reviewable model and source provenance."""
     index_path = model_path / "model.safetensors.index.json"
     processor_path = _processor_file(model_path, "processor_config.json")
+    checkpoint_config_path = model_path / "config.json"
     if not index_path.is_file():
         raise ValueError(f"missing model index: {index_path}")
     if not processor_path.is_file():
         raise ValueError(f"missing processor config: {processor_path}")
+    if not checkpoint_config_path.is_file():
+        raise ValueError(f"missing checkpoint config: {checkpoint_config_path}")
     try:
         index = json.loads(index_path.read_text(encoding="utf-8"))
         shard_names = sorted(set(index["weight_map"].values()))
@@ -217,18 +302,62 @@ def build_service_provenance(model_path: Path) -> dict[str, Any]:
         shard_path = model_path / shard_name
         if not shard_path.is_file() or shard_path.stat().st_size <= 0:
             raise ValueError(f"model index references a missing or empty shard: {shard_path}")
-        shards.append({"name": shard_name, "size_bytes": shard_path.stat().st_size})
+        shards.append(
+            {
+                "name": shard_name,
+                "size_bytes": shard_path.stat().st_size,
+                "sha256": _sha256(shard_path),
+            }
+        )
+    try:
+        checkpoint_config = json.loads(checkpoint_config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid checkpoint config {checkpoint_config_path}: {exc}") from exc
     repository_root = Path(__file__).resolve().parents[2]
     return {
         "model_path": str(model_path.resolve()),
         "model_index_sha256": _sha256(index_path),
         "processor_config_sha256": _sha256(processor_path),
+        "checkpoint_config_sha256": _sha256(checkpoint_config_path),
+        "checkpoint_model_type": checkpoint_config.get("model_type"),
+        "checkpoint_action_horizon": checkpoint_config.get("action_horizon"),
+        "checkpoint_rtc_training_max_prefix_steps": checkpoint_config.get(
+            "rtc_training_max_prefix_steps", 0
+        ),
         "model_shards": shards,
         "groot_revision": _git_revision(repository_root),
         "industrialnext_rpc_revision": _git_revision(
             repository_root / "packages" / "industrialnext_rpc"
         ),
     }
+
+
+def validate_checkpoint_rtc_compatibility(
+    model_path: Path, config: IndustrialNextServingConfig
+) -> None:
+    """Fail closed before model allocation for unsupported checkpoint/mode pairs."""
+    if config.rtc_mode == "off":
+        return
+    config_path = model_path / "config.json"
+    if not config_path.is_file():
+        raise ValueError(f"rtc_mode={config.rtc_mode!r} requires checkpoint config.json")
+    try:
+        model_config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid checkpoint config {config_path}: {exc}") from exc
+    if model_config.get("model_type") != "Gr00tN1d7":
+        raise ValueError("RTC requires a Gr00tN1d7 checkpoint")
+    if model_config.get("action_horizon") != 40:
+        raise ValueError("RTC serving requires a saved 40-step action horizon")
+    if config.rtc_mode == "trained_prefix":
+        trained_max = model_config.get("rtc_training_max_prefix_steps", 0)
+        if isinstance(trained_max, bool) or not isinstance(trained_max, int) or trained_max <= 0:
+            raise ValueError("checkpoint does not advertise trained-prefix support")
+        if config.rtc_max_prefix_steps > trained_max:
+            raise ValueError(
+                f"runtime prefix maximum {config.rtc_max_prefix_steps} exceeds checkpoint "
+                f"trained maximum {trained_max}"
+            )
 
 
 def _warmup_policy(policy: Gr00tPolicy, task_text: str) -> None:

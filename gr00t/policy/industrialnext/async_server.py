@@ -15,6 +15,7 @@ from typing import Any, Mapping, Protocol
 import uuid
 
 from industrialnext_rpc.direct.metadata import Metadata
+import numpy as np
 
 from .adapter import (
     ACTION_HORIZON,
@@ -27,6 +28,7 @@ from .adapter import (
     admit_observation,
     build_model_observation,
     map_action_chunk,
+    map_wire_action_prefix,
     snapshot_is_fresh,
 )
 from .task_catalog import TaskCatalog
@@ -40,6 +42,101 @@ ASYNC_CAPABILITIES = [
     "monitoring_in_step",
     "server_owned_gripper_snap",
 ]
+
+
+def _source_rot6d_matrix(value: list[float]) -> np.ndarray:
+    axes = np.asarray(value, dtype=np.float64).reshape(2, 3)
+    first = axes[0] / np.linalg.norm(axes[0])
+    second = axes[1] - np.dot(first, axes[1]) * first
+    second = second / np.linalg.norm(second)
+    return np.stack((first, second, np.cross(first, second)), axis=1)
+
+
+def _rotation_error_rad(left: list[float], right: list[float]) -> float:
+    delta = _source_rot6d_matrix(left).T @ _source_rot6d_matrix(right)
+    cosine = float(np.clip((np.trace(delta) - 1.0) / 2.0, -1.0, 1.0))
+    return math.acos(cosine)
+
+
+def _prefix_errors(
+    expected: tuple[dict[str, list[float]], ...],
+    actual: tuple[dict[str, list[float]], ...],
+    count: int,
+) -> tuple[float, float, float]:
+    position_error = 0.0
+    orientation_error = 0.0
+    gripper_error = 0.0
+    for expected_row, actual_row in zip(expected[:count], actual[:count]):
+        for side in ("left", "right"):
+            position_error = max(
+                position_error,
+                float(
+                    np.linalg.norm(
+                        np.asarray(actual_row[f"{side}_arm_pose_pos"])
+                        - np.asarray(expected_row[f"{side}_arm_pose_pos"])
+                    )
+                ),
+            )
+            orientation_error = max(
+                orientation_error,
+                _rotation_error_rad(
+                    actual_row[f"{side}_arm_pose_rot"],
+                    expected_row[f"{side}_arm_pose_rot"],
+                ),
+            )
+            gripper_error = max(
+                gripper_error,
+                abs(
+                    float(actual_row[f"{side}_gripper"][0])
+                    - float(expected_row[f"{side}_gripper"][0])
+                ),
+            )
+    return position_error, orientation_error, gripper_error
+
+
+def _trajectory_dynamics(
+    rows: tuple[dict[str, list[float]], ...],
+) -> tuple[float, float, float, float, float]:
+    max_position_step = 0.0
+    max_orientation_step = 0.0
+    max_gripper_step = 0.0
+    max_position_second_difference = 0.0
+    max_gripper_second_difference = 0.0
+    for side in ("left", "right"):
+        positions = np.asarray([row[f"{side}_arm_pose_pos"] for row in rows], dtype=np.float64)
+        grippers = np.asarray([row[f"{side}_gripper"][0] for row in rows], dtype=np.float64)
+        if len(rows) >= 2:
+            max_position_step = max(
+                max_position_step,
+                float(np.linalg.norm(np.diff(positions, axis=0), axis=1).max()),
+            )
+            max_gripper_step = max(max_gripper_step, float(np.abs(np.diff(grippers)).max()))
+            max_orientation_step = max(
+                max_orientation_step,
+                max(
+                    _rotation_error_rad(
+                        rows[index][f"{side}_arm_pose_rot"],
+                        rows[index - 1][f"{side}_arm_pose_rot"],
+                    )
+                    for index in range(1, len(rows))
+                ),
+            )
+        if len(rows) >= 3:
+            max_position_second_difference = max(
+                max_position_second_difference,
+                float(np.linalg.norm(np.diff(positions, n=2, axis=0), axis=1).max()),
+            )
+            max_gripper_second_difference = max(
+                max_gripper_second_difference,
+                float(np.abs(np.diff(grippers, n=2)).max()),
+            )
+    return (
+        max_position_step,
+        max_orientation_step,
+        max_gripper_step,
+        max_position_second_difference,
+        max_gripper_second_difference,
+    )
 
 
 class Policy(Protocol):
@@ -57,6 +154,22 @@ class IndustrialNextServingConfig:
     min_usable_action_steps: int = 1
     idle_session_timeout_s: float = 300.0
     stats_log_interval_steps: int = 250
+    rtc_mode: str = "off"
+    rtc_initial_frozen_steps: int = 1
+    rtc_delay_window_size: int = 20
+    rtc_delay_margin_steps: int = 1
+    rtc_max_prefix_steps: int = 24
+    rtc_native_overlap_steps: int = 24
+    rtc_min_new_tail_steps: int = 16
+    rtc_ramp_rate: float = 6.0
+    rtc_position_tolerance: float = 1e-4
+    rtc_orientation_tolerance_rad: float = 1e-3
+    rtc_gripper_tolerance: float = 1e-4
+    max_position_step_m: float | None = None
+    max_orientation_step_rad: float | None = None
+    max_gripper_step: float | None = None
+    max_position_second_difference_m: float | None = None
+    max_gripper_second_difference: float | None = None
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.control_hz) or self.control_hz != 50.0:
@@ -81,14 +194,66 @@ class IndustrialNextServingConfig:
             or self.stats_log_interval_steps < 0
         ):
             raise ValueError("stats_log_interval_steps must be a non-negative integer")
+        if self.rtc_mode not in {"off", "native", "trained_prefix"}:
+            raise ValueError("rtc_mode must be one of: off, native, trained_prefix")
+        integer_fields = {
+            "rtc_initial_frozen_steps": self.rtc_initial_frozen_steps,
+            "rtc_delay_window_size": self.rtc_delay_window_size,
+            "rtc_delay_margin_steps": self.rtc_delay_margin_steps,
+            "rtc_max_prefix_steps": self.rtc_max_prefix_steps,
+            "rtc_native_overlap_steps": self.rtc_native_overlap_steps,
+            "rtc_min_new_tail_steps": self.rtc_min_new_tail_steps,
+        }
+        for name, value in integer_fields.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.rtc_delay_window_size < 1:
+            raise ValueError("rtc_delay_window_size must be positive")
+        if not 1 <= self.rtc_initial_frozen_steps <= self.rtc_max_prefix_steps:
+            raise ValueError("rtc_initial_frozen_steps must be within [1, rtc_max_prefix_steps]")
+        if self.rtc_max_prefix_steps + self.rtc_min_new_tail_steps > ACTION_HORIZON:
+            raise ValueError("rtc_max_prefix_steps must leave rtc_min_new_tail_steps")
+        if not self.rtc_initial_frozen_steps <= self.rtc_native_overlap_steps:
+            raise ValueError("rtc_native_overlap_steps must cover rtc_initial_frozen_steps")
+        if self.rtc_native_overlap_steps + self.rtc_min_new_tail_steps > ACTION_HORIZON:
+            raise ValueError("rtc_native_overlap_steps must leave rtc_min_new_tail_steps")
+        finite_positive_fields = {
+            "rtc_ramp_rate": self.rtc_ramp_rate,
+            "rtc_position_tolerance": self.rtc_position_tolerance,
+            "rtc_orientation_tolerance_rad": self.rtc_orientation_tolerance_rad,
+            "rtc_gripper_tolerance": self.rtc_gripper_tolerance,
+        }
+        for name, value in finite_positive_fields.items():
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        optional_limits = {
+            "max_position_step_m": self.max_position_step_m,
+            "max_orientation_step_rad": self.max_orientation_step_rad,
+            "max_gripper_step": self.max_gripper_step,
+            "max_position_second_difference_m": self.max_position_second_difference_m,
+            "max_gripper_second_difference": self.max_gripper_second_difference,
+        }
+        for name, value in optional_limits.items():
+            if value is not None and (not math.isfinite(value) or value <= 0):
+                raise ValueError(f"{name} must be None or finite and positive")
+
+
+@dataclass(frozen=True)
+class InferenceRequest:
+    snapshot: ObservationSnapshot
+    rtc_mode: str
+    prefix_rows: tuple[dict[str, list[float]], ...] = ()
+    predicted_frozen_steps: int = 0
+    overlap_steps: int = 0
 
 
 @dataclass(frozen=True)
 class InferenceResult:
-    snapshot: ObservationSnapshot
+    request: InferenceRequest
     rows: tuple[dict[str, list[float]], ...]
     inference_latency_ms: float
     image_decode_latency_ms: float
+    policy_info: Mapping[str, Any]
 
 
 @dataclass
@@ -98,6 +263,10 @@ class SessionStats:
     ignored_depth_fields: int = 0
     inference_failures: int = 0
     rejected_tails: int = 0
+    rejected_delay_underestimates: int = 0
+    rejected_prefix_mismatches: int = 0
+    missing_prefixes: int = 0
+    rejected_dynamics: int = 0
     expired_rows: int = 0
     stale_pending_snapshots: int = 0
     null_reasons: dict[str, int] = field(default_factory=dict)
@@ -138,6 +307,8 @@ class ActiveSession:
     monitoring_timestep: int = -1
     image_cache: dict[str, CachedImage] = field(default_factory=dict)
     timeline: dict[int, dict[str, list[float]]] = field(default_factory=dict)
+    served_history: dict[int, dict[str, list[float]]] = field(default_factory=dict)
+    observed_delays: list[int] = field(default_factory=list)
     inference_status: str = "idle"
     inference_latency_ms: float = 0.0
     image_decode_latency_ms: float = 0.0
@@ -147,6 +318,24 @@ class ActiveSession:
     latest_source_timestep: int | None = None
     latest_image_ages: dict[str, int | None] = field(default_factory=dict)
     latest_null_reason: str = "startup"
+    latest_rtc_mode: str = "off"
+    latest_predicted_delay_steps: int = 0
+    latest_actual_delay_steps: int = 0
+    latest_overlap_steps: int = 0
+    latest_available_prefix_steps: int = 0
+    latest_new_tail_steps: int = 0
+    latest_prefix_position_error: float = 0.0
+    latest_prefix_orientation_error_rad: float = 0.0
+    latest_prefix_gripper_error: float = 0.0
+    latest_max_position_step_m: float = 0.0
+    latest_max_orientation_step_rad: float = 0.0
+    latest_max_gripper_step: float = 0.0
+    latest_max_position_second_difference_m: float = 0.0
+    latest_max_gripper_second_difference: float = 0.0
+    latest_first_admitted_position_seam_m: float = 0.0
+    latest_first_admitted_orientation_seam_rad: float = 0.0
+    latest_first_admitted_gripper_seam: float = 0.0
+    requires_reregistration: bool = False
     stats: SessionStats = field(default_factory=SessionStats)
 
 
@@ -328,6 +517,25 @@ class IndustrialNextAsyncServer:
             "max_image_staleness_steps": self.config.max_image_staleness_steps,
             "min_usable_action_steps": self.config.min_usable_action_steps,
             "idle_session_timeout_s": self.config.idle_session_timeout_s,
+            "rtc": {
+                "mode": self.config.rtc_mode,
+                "initial_frozen_steps": self.config.rtc_initial_frozen_steps,
+                "delay_window_size": self.config.rtc_delay_window_size,
+                "delay_margin_steps": self.config.rtc_delay_margin_steps,
+                "max_prefix_steps": self.config.rtc_max_prefix_steps,
+                "native_overlap_steps": self.config.rtc_native_overlap_steps,
+                "min_new_tail_steps": self.config.rtc_min_new_tail_steps,
+                "ramp_rate": self.config.rtc_ramp_rate,
+                "action_limits": {
+                    "max_position_step_m": self.config.max_position_step_m,
+                    "max_orientation_step_rad": self.config.max_orientation_step_rad,
+                    "max_gripper_step": self.config.max_gripper_step,
+                    "max_position_second_difference_m": (
+                        self.config.max_position_second_difference_m
+                    ),
+                    "max_gripper_second_difference": (self.config.max_gripper_second_difference),
+                },
+            },
         }
 
     def _register_session(self, request: Mapping[str, Any]) -> dict[str, Any]:
@@ -422,11 +630,20 @@ class IndustrialNextAsyncServer:
             session.latest_null_reason = null_reason
             session.stats.record_null(null_reason)
         else:
+            session.served_history[candidate_timestep] = action
+            oldest_history = candidate_timestep - ACTION_HORIZON + 1
+            session.served_history = {
+                target: row
+                for target, row in session.served_history.items()
+                if target >= oldest_history
+            }
             session.total_actions_served += 1
             session.latest_null_reason = ""
 
         if admission.snapshot is not None:
-            if self._inference_future is None:
+            if session.requires_reregistration:
+                session.inference_status = "reregistration_required"
+            elif self._inference_future is None:
                 self._launch_inference(admission.snapshot)
             else:
                 self._pending_snapshot = admission.snapshot
@@ -448,13 +665,99 @@ class IndustrialNextAsyncServer:
             raise SessionNotFoundError("session_not_found")
         return session
 
+    def _contiguous_prefix(
+        self, session: ActiveSession, source_timestep: int
+    ) -> tuple[dict[str, list[float]], ...]:
+        rows: list[dict[str, list[float]]] = []
+        for target in range(source_timestep, source_timestep + ACTION_HORIZON):
+            row = session.served_history.get(target)
+            if row is None:
+                row = session.timeline.get(target)
+            if row is None:
+                break
+            rows.append(row)
+        return tuple(rows)
+
+    def _predict_frozen_steps(self, session: ActiveSession) -> int:
+        observed_max = (
+            max(session.observed_delays)
+            if session.observed_delays
+            else self.config.rtc_initial_frozen_steps
+        )
+        return min(
+            self.config.rtc_max_prefix_steps,
+            max(
+                self.config.rtc_initial_frozen_steps,
+                observed_max + self.config.rtc_delay_margin_steps,
+            ),
+        )
+
+    def _build_inference_request(
+        self, session: ActiveSession, snapshot: ObservationSnapshot
+    ) -> InferenceRequest | None:
+        if self.config.rtc_mode == "off" or session.total_inferences == 0:
+            return InferenceRequest(snapshot=snapshot, rtc_mode="off")
+
+        prefix = self._contiguous_prefix(session, snapshot.source_timestep)
+        available = len(prefix)
+        predicted = self._predict_frozen_steps(session)
+        session.latest_available_prefix_steps = available
+        session.latest_predicted_delay_steps = predicted
+        if available < predicted:
+            session.inference_status = "missing_prefix"
+            session.latest_inference_error = (
+                f"missing_contiguous_prefix: {available} < predicted {predicted}"
+            )
+            session.stats.missing_prefixes += 1
+            return None
+
+        if self.config.rtc_mode == "native":
+            overlap = min(
+                available,
+                self.config.rtc_native_overlap_steps,
+                ACTION_HORIZON - self.config.rtc_min_new_tail_steps,
+            )
+            if overlap < predicted:
+                session.inference_status = "missing_prefix"
+                session.latest_inference_error = (
+                    f"native_overlap_below_frozen: {overlap} < {predicted}"
+                )
+                session.stats.missing_prefixes += 1
+                return None
+            return InferenceRequest(
+                snapshot=snapshot,
+                rtc_mode="native",
+                prefix_rows=prefix[:overlap],
+                predicted_frozen_steps=predicted,
+                overlap_steps=overlap,
+            )
+
+        if predicted > self.config.rtc_max_prefix_steps:
+            session.inference_status = "prefix_out_of_range"
+            session.latest_inference_error = (
+                f"predicted prefix {predicted} exceeds trained maximum "
+                f"{self.config.rtc_max_prefix_steps}"
+            )
+            return None
+        return InferenceRequest(
+            snapshot=snapshot,
+            rtc_mode="trained_prefix",
+            prefix_rows=prefix[:predicted],
+            predicted_frozen_steps=predicted,
+            overlap_steps=predicted,
+        )
+
     def _launch_inference(self, snapshot: ObservationSnapshot) -> None:
         session = self._active_session
-        if session is None or not snapshot_is_fresh(
-            snapshot,
-            current_timestep=session.timestep,
-            active_generation=session.generation,
-            max_staleness_steps=self.config.max_image_staleness_steps,
+        if (
+            session is None
+            or session.requires_reregistration
+            or not snapshot_is_fresh(
+                snapshot,
+                current_timestep=session.timestep,
+                active_generation=session.generation,
+                max_staleness_steps=self.config.max_image_staleness_steps,
+            )
         ):
             if session is not None:
                 session.stats.stale_pending_snapshots += 1
@@ -462,28 +765,48 @@ class IndustrialNextAsyncServer:
         if self._inference_future is not None:
             self._pending_snapshot = snapshot
             return
+        request = self._build_inference_request(session, snapshot)
+        if request is None:
+            return
         loop = self._bind_event_loop()
         session.inference_status = "running"
-        future = loop.run_in_executor(self.executor, self._run_inference, snapshot)
+        session.latest_rtc_mode = request.rtc_mode
+        session.latest_overlap_steps = request.overlap_steps
+        session.latest_new_tail_steps = ACTION_HORIZON - request.overlap_steps
+        future = loop.run_in_executor(self.executor, self._run_inference, request)
         self._inference_future = future
-        future.add_done_callback(lambda completed: self._complete_inference(snapshot, completed))
+        future.add_done_callback(lambda completed: self._complete_inference(request, completed))
 
-    def _run_inference(self, snapshot: ObservationSnapshot) -> InferenceResult:
+    def _run_inference(self, request: InferenceRequest) -> InferenceResult:
         started_at = time.perf_counter()
-        model_observation = build_model_observation(snapshot)
+        model_observation = build_model_observation(request.snapshot)
         decode_ms = (time.perf_counter() - started_at) * 1000.0
-        action, _ = self.policy.get_action(model_observation)
+        options: dict[str, Any] = {"rtc_mode": request.rtc_mode}
+        if request.rtc_mode != "off":
+            options["action_prefix"] = map_wire_action_prefix(request.prefix_rows)
+        if request.rtc_mode == "native":
+            options.update(
+                {
+                    "rtc_frozen_steps": request.predicted_frozen_steps,
+                    "rtc_overlap_steps": request.overlap_steps,
+                    "rtc_ramp_rate": self.config.rtc_ramp_rate,
+                }
+            )
+        elif request.rtc_mode == "trained_prefix":
+            options["rtc_prefix_steps"] = request.predicted_frozen_steps
+        action, policy_info = self.policy.get_action(model_observation, options=options)
         rows = map_action_chunk(action)
         return InferenceResult(
-            snapshot=snapshot,
+            request=request,
             rows=rows,
             inference_latency_ms=(time.perf_counter() - started_at) * 1000.0,
             image_decode_latency_ms=decode_ms,
+            policy_info=policy_info,
         )
 
     def _complete_inference(
         self,
-        snapshot: ObservationSnapshot,
+        request: InferenceRequest,
         future: asyncio.Future[InferenceResult],
     ) -> None:
         if future is not self._inference_future:
@@ -493,10 +816,12 @@ class IndustrialNextAsyncServer:
         try:
             result = future.result()
         except Exception as exc:
-            if session is not None and session.generation == snapshot.generation:
+            if session is not None and session.generation == request.snapshot.generation:
                 session.inference_status = "error"
                 session.latest_inference_error = f"{type(exc).__name__}: {exc}"
                 session.stats.inference_failures += 1
+                if not session.timeline:
+                    session.requires_reregistration = True
                 logger.error(
                     "GR00T inference failed",
                     exc_info=(type(exc), exc, exc.__traceback__),
@@ -505,22 +830,106 @@ class IndustrialNextAsyncServer:
             if (
                 not self._closed
                 and session is not None
-                and session.generation == result.snapshot.generation
+                and session.generation == result.request.snapshot.generation
             ):
                 self._admit_inference_result(session, result)
         self._launch_pending_if_valid()
 
     def _admit_inference_result(self, session: ActiveSession, result: InferenceResult) -> None:
-        future_rows = {
-            result.snapshot.source_timestep + index: row
-            for index, row in enumerate(result.rows)
-            if result.snapshot.source_timestep + index > session.timestep
-        }
+        request = result.request
+        actual_delay = max(1, session.timestep - request.snapshot.source_timestep + 1)
+        session.latest_actual_delay_steps = actual_delay
+        session.observed_delays.append(actual_delay)
+        session.observed_delays = session.observed_delays[-self.config.rtc_delay_window_size :]
         session.inference_latency_ms = result.inference_latency_ms
         session.image_decode_latency_ms = result.image_decode_latency_ms
         session.total_inferences += 1
-        session.latest_source_timestep = result.snapshot.source_timestep
+        session.latest_source_timestep = request.snapshot.source_timestep
         session.stats.record_grippers(result.rows)
+
+        dynamics = _trajectory_dynamics(result.rows)
+        (
+            session.latest_max_position_step_m,
+            session.latest_max_orientation_step_rad,
+            session.latest_max_gripper_step,
+            session.latest_max_position_second_difference_m,
+            session.latest_max_gripper_second_difference,
+        ) = dynamics
+        if actual_delay < len(result.rows):
+            seam = _prefix_errors(
+                (result.rows[actual_delay - 1],),
+                (result.rows[actual_delay],),
+                1,
+            )
+            (
+                session.latest_first_admitted_position_seam_m,
+                session.latest_first_admitted_orientation_seam_rad,
+                session.latest_first_admitted_gripper_seam,
+            ) = seam
+        limits = (
+            self.config.max_position_step_m,
+            self.config.max_orientation_step_rad,
+            self.config.max_gripper_step,
+            self.config.max_position_second_difference_m,
+            self.config.max_gripper_second_difference,
+        )
+        violated = [
+            (value, limit)
+            for value, limit in zip(dynamics, limits)
+            if limit is not None and value > limit
+        ]
+        if violated:
+            session.stats.rejected_dynamics += 1
+            session.latest_inference_error = (
+                f"action_dynamics_limit: values={dynamics}, limits={limits}"
+            )
+            session.inference_status = "action_dynamics_limit"
+            if not session.timeline:
+                session.requires_reregistration = True
+            return
+
+        if request.rtc_mode != "off" and actual_delay > request.predicted_frozen_steps:
+            session.stats.rejected_delay_underestimates += 1
+            session.latest_inference_error = (
+                "delay_underestimate: "
+                f"actual {actual_delay} > predicted {request.predicted_frozen_steps}"
+            )
+            session.inference_status = "delay_underestimate"
+            if not session.timeline:
+                session.requires_reregistration = True
+            return
+
+        if request.rtc_mode != "off":
+            hard_prefix_steps = request.predicted_frozen_steps
+            position_error, orientation_error, gripper_error = _prefix_errors(
+                request.prefix_rows,
+                result.rows,
+                hard_prefix_steps,
+            )
+            session.latest_prefix_position_error = position_error
+            session.latest_prefix_orientation_error_rad = orientation_error
+            session.latest_prefix_gripper_error = gripper_error
+            if (
+                position_error > self.config.rtc_position_tolerance
+                or orientation_error > self.config.rtc_orientation_tolerance_rad
+                or gripper_error > self.config.rtc_gripper_tolerance
+            ):
+                session.stats.rejected_prefix_mismatches += 1
+                session.latest_inference_error = (
+                    "hard_prefix_mismatch: "
+                    f"position={position_error:.6g}, orientation={orientation_error:.6g}, "
+                    f"gripper={gripper_error:.6g}"
+                )
+                session.inference_status = "prefix_mismatch"
+                if not session.timeline:
+                    session.requires_reregistration = True
+                return
+
+        future_rows = {
+            request.snapshot.source_timestep + index: row
+            for index, row in enumerate(result.rows)
+            if request.snapshot.source_timestep + index > session.timestep
+        }
         if len(future_rows) < self.config.min_usable_action_steps:
             session.stats.rejected_tails += 1
             session.latest_inference_error = (
@@ -528,6 +937,8 @@ class IndustrialNextAsyncServer:
                 f"{len(future_rows)} < {self.config.min_usable_action_steps}"
             )
             session.inference_status = "insufficient_tail"
+            if not session.timeline:
+                session.requires_reregistration = True
             return
         session.timeline = future_rows
         session.latest_inference_error = None
@@ -588,10 +999,20 @@ class IndustrialNextAsyncServer:
             return "missing_images"
         if admission.stale_images:
             return "stale_images"
+        if session.requires_reregistration:
+            return "reregistration_required"
         if session.inference_status == "error":
             return "inference_error"
         if session.inference_status == "insufficient_tail":
             return "insufficient_tail"
+        if session.inference_status in {
+            "delay_underestimate",
+            "prefix_mismatch",
+            "missing_prefix",
+            "prefix_out_of_range",
+            "action_dynamics_limit",
+        }:
+            return session.inference_status
         if self._inference_future is not None:
             return "inference_running"
         if session.total_inferences == 0:
@@ -622,6 +1043,27 @@ class IndustrialNextAsyncServer:
             "image_age_steps": dict(session.latest_image_ages),
             "image_decode_latency_ms": session.image_decode_latency_ms,
             "null_reason": session.latest_null_reason,
+            "rtc_mode": session.latest_rtc_mode,
+            "rtc_predicted_delay_steps": session.latest_predicted_delay_steps,
+            "rtc_actual_delay_steps": session.latest_actual_delay_steps,
+            "rtc_overlap_steps": session.latest_overlap_steps,
+            "rtc_available_prefix_steps": session.latest_available_prefix_steps,
+            "rtc_new_tail_steps": session.latest_new_tail_steps,
+            "rtc_prefix_position_error": session.latest_prefix_position_error,
+            "rtc_prefix_orientation_error_rad": session.latest_prefix_orientation_error_rad,
+            "rtc_prefix_gripper_error": session.latest_prefix_gripper_error,
+            "rtc_delay_window": list(session.observed_delays),
+            "max_position_step_m": session.latest_max_position_step_m,
+            "max_orientation_step_rad": session.latest_max_orientation_step_rad,
+            "max_gripper_step": session.latest_max_gripper_step,
+            "max_position_second_difference_m": (session.latest_max_position_second_difference_m),
+            "max_gripper_second_difference": session.latest_max_gripper_second_difference,
+            "first_admitted_position_seam_m": (session.latest_first_admitted_position_seam_m),
+            "first_admitted_orientation_seam_rad": (
+                session.latest_first_admitted_orientation_seam_rad
+            ),
+            "first_admitted_gripper_seam": session.latest_first_admitted_gripper_seam,
+            "requires_reregistration": session.requires_reregistration,
         }
         monitoring_grippers = (
             {}
@@ -679,7 +1121,10 @@ class IndustrialNextAsyncServer:
             "GR00T async stats session=%s step=%d server_step_ms=%.3f "
             "inference_ms=%.1f decode_ms=%.1f queue=%d missing_rgb=%d stale_rgb=%d "
             "ignored_depth=%d inference_failures=%d expired_rows=%d rejected_tails=%d "
-            "stale_pending=%d null_reasons=%s gripper_range=(%s,%s)",
+            "stale_pending=%d rtc_mode=%s delay=(%d,%d) overlap=%d available_prefix=%d "
+            "new_tail=%d rejected_delay=%d rejected_prefix=%d rejected_dynamics=%d "
+            "missing_prefix=%d "
+            "null_reasons=%s gripper_range=(%s,%s)",
             session.session_id,
             session.timestep,
             server_step_ms,
@@ -693,6 +1138,16 @@ class IndustrialNextAsyncServer:
             session.stats.expired_rows,
             session.stats.rejected_tails,
             session.stats.stale_pending_snapshots,
+            session.latest_rtc_mode,
+            session.latest_predicted_delay_steps,
+            session.latest_actual_delay_steps,
+            session.latest_overlap_steps,
+            session.latest_available_prefix_steps,
+            session.latest_new_tail_steps,
+            session.stats.rejected_delay_underestimates,
+            session.stats.rejected_prefix_mismatches,
+            session.stats.rejected_dynamics,
+            session.stats.missing_prefixes,
             session.stats.null_reasons,
             session.stats.gripper_min,
             session.stats.gripper_max,

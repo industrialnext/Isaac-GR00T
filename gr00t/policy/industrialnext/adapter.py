@@ -32,6 +32,14 @@ STATE_FIELD_WIDTHS: tuple[tuple[str, int], ...] = (
     ("right_gripper", 1),
     ("right_ft", 6),
 )
+ACTION_FIELD_WIDTHS: tuple[tuple[str, int], ...] = (
+    ("left_arm_pose_pos", 3),
+    ("left_arm_pose_rot", 6),
+    ("left_gripper", 1),
+    ("right_arm_pose_pos", 3),
+    ("right_arm_pose_rot", 6),
+    ("right_gripper", 1),
+)
 IMAGE_KEY_TO_MODEL_KEY: Mapping[str, str] = MappingProxyType(
     {
         "head_rgb": "head",
@@ -334,6 +342,41 @@ def map_action_chunk(action: Mapping[str, Any]) -> tuple[dict[str, list[float]],
             }
         )
     return tuple(rows)
+
+
+def map_wire_action_prefix(rows: Any) -> dict[str, np.ndarray]:
+    """Map contiguous Industrial Next action rows to batched absolute GR00T actions."""
+    if not isinstance(rows, list | tuple) or not rows:
+        raise ValueError("action prefix must be a non-empty sequence of wire action rows")
+    if len(rows) > ACTION_HORIZON:
+        raise ValueError(f"action prefix exceeds the {ACTION_HORIZON}-step action horizon")
+
+    expected_fields = {name for name, _ in ACTION_FIELD_WIDTHS}
+    parsed: dict[str, list[tuple[float, ...]]] = {name: [] for name in expected_fields}
+    for row_index, row in enumerate(rows):
+        if not isinstance(row, Mapping) or set(row) != expected_fields:
+            actual = sorted(row) if isinstance(row, Mapping) else type(row).__name__
+            raise ValueError(
+                f"action prefix row {row_index} fields differ: expected "
+                f"{sorted(expected_fields)}, got {actual}"
+            )
+        for name, width in ACTION_FIELD_WIDTHS:
+            parsed[name].append(_finite_tuple(row[name], width, f"action[{row_index}].{name}"))
+
+    left_position = np.asarray(parsed["left_arm_pose_pos"], dtype=np.float32)
+    right_position = np.asarray(parsed["right_arm_pose_pos"], dtype=np.float32)
+    left_rotation = rot6d_source_to_groot(
+        np.asarray(parsed["left_arm_pose_rot"], dtype=np.float32)
+    ).astype(np.float32)
+    right_rotation = rot6d_source_to_groot(
+        np.asarray(parsed["right_arm_pose_rot"], dtype=np.float32)
+    ).astype(np.float32)
+    return {
+        "left_eef": np.concatenate((left_position, left_rotation), axis=-1)[None, ...],
+        "left_gripper": np.asarray(parsed["left_gripper"], dtype=np.float32)[None, ...],
+        "right_eef": np.concatenate((right_position, right_rotation), axis=-1)[None, ...],
+        "right_gripper": np.asarray(parsed["right_gripper"], dtype=np.float32)[None, ...],
+    }
 
 
 def _require_modality(

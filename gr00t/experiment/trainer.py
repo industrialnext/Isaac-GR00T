@@ -283,6 +283,65 @@ class Gr00tTrainer(Trainer):
         # Record last loss for testing purposes.
         self.loss = loss
 
+        if model.training and "rtc_prefix_lengths" in outputs:
+            prefix_lengths = outputs["rtc_prefix_lengths"].detach().long()
+            unwrapped_model = self.accelerator.unwrap_model(model)
+            trained_max = int(getattr(unwrapped_model.config, "rtc_training_max_prefix_steps", 0))
+            batch_histogram = torch.bincount(
+                prefix_lengths,
+                minlength=trained_max + 1,
+            ).to(device=loss.device, dtype=torch.float64)
+            batch_postfix_valid = (
+                outputs["rtc_postfix_valid_elements"]
+                .detach()
+                .to(device=loss.device, dtype=torch.float64)
+            )
+            prefix_histogram = getattr(self, "_rtc_prefix_histogram", None)
+            if prefix_histogram is None or prefix_histogram.shape != batch_histogram.shape:
+                prefix_histogram = torch.zeros_like(batch_histogram)
+            prefix_histogram.add_(batch_histogram)
+            postfix_valid = getattr(
+                self,
+                "_rtc_postfix_valid_elements",
+                torch.zeros((), device=loss.device, dtype=torch.float64),
+            )
+            postfix_valid.add_(batch_postfix_valid)
+            self._rtc_prefix_histogram = prefix_histogram
+            self._rtc_postfix_valid_elements = postfix_valid
+
+            configured_logging_steps = (
+                getattr(self.state, "logging_steps", None) or self.args.logging_steps
+            )
+            logging_steps = max(1, int(configured_logging_steps))
+            should_log_rtc = (
+                self.state.global_step > 0
+                and self.state.global_step % logging_steps == 0
+                and getattr(self, "_last_rtc_logged_step", -1) != self.state.global_step
+            )
+            if should_log_rtc:
+                self._last_rtc_logged_step = self.state.global_step
+                reduced_histogram = prefix_histogram.clone()
+                reduced_postfix_valid = postfix_valid.clone()
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(reduced_histogram)
+                    torch.distributed.all_reduce(reduced_postfix_valid)
+                total = reduced_histogram.sum().clamp_min(1.0)
+                rtc_logs = {
+                    f"rtc_prefix_count_{index}": count.item()
+                    for index, count in enumerate(reduced_histogram)
+                }
+                rtc_logs.update(
+                    {
+                        f"rtc_prefix_fraction_{index}": (count / total).item()
+                        for index, count in enumerate(reduced_histogram)
+                    }
+                )
+                rtc_logs["rtc_postfix_valid_elements"] = reduced_postfix_valid.item()
+                if self.is_world_process_zero():
+                    self.log(rtc_logs)
+                prefix_histogram.zero_()
+                postfix_valid.zero_()
+
         # --------------------------------------------------------------
         # Accuracy calculation
         # --------------------------------------------------------------

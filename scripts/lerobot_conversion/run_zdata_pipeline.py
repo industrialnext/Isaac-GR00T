@@ -33,10 +33,26 @@ def _parser() -> argparse.ArgumentParser:
     check.add_argument("--config", required=True, type=Path)
     check.add_argument("--full", action="store_true")
 
+    freeze = subcommands.add_parser(
+        "freeze", help="fully validate and content-bind a corpus against further writes"
+    )
+    freeze.add_argument("--config", required=True, type=Path)
+
     train = subcommands.add_parser("train", help="prepare statistics and launch finetuning")
     train.add_argument("--config", required=True, type=Path)
     train.add_argument("--jobs", type=int)
     train.add_argument("--resume-from", type=Path)
+    train.add_argument(
+        "--smoke-max-steps",
+        type=int,
+        help="run a fresh bounded one-GPU training smoke with this many steps",
+    )
+    train.add_argument(
+        "--smoke-batch",
+        type=int,
+        default=1,
+        help="global batch for --smoke-max-steps (default: 1)",
+    )
 
     return parser
 
@@ -72,9 +88,19 @@ def main(argv: list[str] | None = None) -> int:
         from zdata_pipeline.check import check_outputs
 
         return check_outputs(config, full=args.full)
+    if args.command == "freeze":
+        from zdata_pipeline.check import freeze_corpus
+
+        return freeze_corpus(config)
     from zdata_pipeline.check import train
 
-    return train(config, jobs=args.jobs, resume_from=args.resume_from)
+    return train(
+        config,
+        jobs=args.jobs,
+        resume_from=args.resume_from,
+        smoke_max_steps=args.smoke_max_steps,
+        smoke_batch=args.smoke_batch,
+    )
 
 
 if __name__ == "__main__":

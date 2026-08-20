@@ -1,0 +1,25 @@
+schema_version: 1
+checkpoint: checkpoint-3496
+embodiment_tag: new_embodiment
+control_hz: 50
+rtc:
+  initial_frozen_steps: 4
+  delay_window_size: 20
+  delay_margin_steps: 2
+  max_prefix_steps: 12
+  native_overlap_steps: 12
+  min_new_tail_steps: 16
+  min_usable_action_steps: 16
+  ramp_rate: 6.0
+tolerances:
+  position_m: 0.0001
+  orientation_rad: 0.001
+  gripper: 0.0001
+deployment_fill_before_shadow:
+  checkout_revision: null
+  service_name: null
+  previous_launch_command: null
+  rollback_command: null
+  task_uuid: null
+  task_text: null
+motion_authorized: false

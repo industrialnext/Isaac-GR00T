@@ -153,6 +153,16 @@ class TestActionNormalization:
             assert val.min() >= -1.0, f"{key}: action value {val.min()} < -1"
             assert val.max() <= 1.0, f"{key}: action value {val.max()} > 1"
 
+    def test_action_clipping_can_be_disabled_for_one_call(
+        self, processor, modality_keys, statistics
+    ):
+        _, action_keys = modality_keys
+        raw = _random_action(action_keys, statistics)
+        raw = {key: value * 1_000_000 for key, value in raw.items()}
+        result = processor.apply_action(raw, EMBODIMENT, clip_outliers=False)
+        assert any(np.any(np.abs(value) > 1.0) for value in result.values())
+        assert processor.clip_outliers is True
+
     def test_action_roundtrip(self, processor, modality_keys, statistics):
         _, action_keys = modality_keys
         # Use values within the normalization range to avoid clipping

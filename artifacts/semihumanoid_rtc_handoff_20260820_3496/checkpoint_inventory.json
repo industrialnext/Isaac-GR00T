@@ -1,0 +1,37 @@
+[
+  {
+    "path": "config.json",
+    "sha256": "ca2c610c837aeaa42ece34b4d34c0ad6465bc8e7817c7f398f3d3a735286428e",
+    "size_bytes": 2186
+  },
+  {
+    "path": "embodiment_id.json",
+    "sha256": "c8af3d61fe9ca5508c4a5b9e8be6ad4d0d1eb2c68cec76620ea089b894a3ee22",
+    "size_bytes": 2226
+  },
+  {
+    "path": "model-00001-of-00002.safetensors",
+    "sha256": "8d498904643b69ea997129a4f93bc40c61a880b457ebe2f51d2eeb03903dc0b5",
+    "size_bytes": 4990519232
+  },
+  {
+    "path": "model-00002-of-00002.safetensors",
+    "sha256": "ed2033c4d5ee828c47b8fa9cf529f9d1fc941b26f1c76ce54425e54609bb29fb",
+    "size_bytes": 1919980184
+  },
+  {
+    "path": "model.safetensors.index.json",
+    "sha256": "407804ea5a62f4f8823f48811ae0edbb82fac101e9cf4d7273e6e2f692bb4d59",
+    "size_bytes": 104985
+  },
+  {
+    "path": "processor_config.json",
+    "sha256": "6ca23beee713034452d850b3096b6981eb209211e19656102b96bfd49865cb42",
+    "size_bytes": 27451
+  },
+  {
+    "path": "statistics.json",
+    "sha256": "41b3c677174e4cac60cd9af4d104183e5122c77ca9d8645afbcc48556de41cdd",
+    "size_bytes": 4456083
+  }
+]

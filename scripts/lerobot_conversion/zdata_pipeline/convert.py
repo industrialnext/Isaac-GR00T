@@ -20,7 +20,7 @@ import uuid
 import h5py
 import pandas as pd
 
-from .common import STATS_FILES, transaction_journals
+from .common import STATS_FILES, assert_output_mutable, transaction_journals
 from .config import (
     PipelineConfig,
     ResolvedLayout,
@@ -729,6 +729,8 @@ def sync_config(
         raise ValueError("workers must be positive")
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive")
+    if not dry_run:
+        assert_output_mutable(config.output.root)
     subsets = resolve_source_subsets(config)
     selector_map, unmatched = _selector_map(subsets, reconvert or [])
     if unmatched:
@@ -911,9 +913,22 @@ def _sync_locked(
             task_index = tasks.index_for(config, description.task_id, description.task_text)
             for assignment in assignments:
                 assignment["task_index"] = task_index
+            current_stat = description.path.stat()
+            if (
+                description.source_size_bytes is None
+                or description.source_mtime_ns is None
+                or current_stat.st_size != description.source_size_bytes
+                or current_stat.st_mtime_ns != description.source_mtime_ns
+            ):
+                overall_failures[f"{subset.name}/{description.key}"] = (
+                    "source changed between inspection and conversion commit"
+                )
+                continue
             pending_record = {
                 "status": "complete",
                 "task_id": description.task_id,
+                "source_size_bytes": description.source_size_bytes,
+                "source_mtime_ns": description.source_mtime_ns,
                 "segments": assignments,
             }
             changes_by_dataset.setdefault(dataset_name, []).append(

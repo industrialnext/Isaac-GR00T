@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+import hashlib
 import importlib.util
 import json
 import math
@@ -20,8 +21,13 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 
-from .common import STATS_FILES, assert_no_incomplete_transactions
-from .config import PipelineConfig, modality_module_path, render_modality_module
+from .common import STATS_FILES, assert_no_incomplete_transactions, frozen_corpus_manifest_path
+from .config import (
+    PipelineConfig,
+    modality_module_path,
+    render_modality_module,
+    resolve_source_subsets,
+)
 
 
 REPO_ROOT = Path(__file__).parents[3]
@@ -77,6 +83,11 @@ def _generate_missing_stats(config: PipelineConfig, datasets: list[Path], jobs: 
     if not missing:
         print(f"statistics are current for {len(datasets)} dataset(s)")
         return 0
+    frozen_manifest = frozen_corpus_manifest_path(config.output.root)
+    if frozen_manifest.exists():
+        raise RuntimeError(
+            f"frozen corpus is missing statistics for {missing}; use a new output root"
+        )
     worker_count = jobs if jobs is not None else min(4, len(missing))
     if worker_count <= 0:
         raise ValueError("--jobs must be positive")
@@ -438,6 +449,10 @@ def build_train_command(
     *,
     resume_from: Path | None = None,
     now: Callable[[], datetime] | None = None,
+    gpus_override: int | None = None,
+    batch_override: int | None = None,
+    max_steps_override: int | None = None,
+    output_name_suffix: str = "",
 ) -> tuple[list[str], Path, int, int]:
     from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 
@@ -445,10 +460,12 @@ def build_train_command(
         raise ValueError("no train datasets")
     if any(dataset.name.endswith(VAL_SUFFIX) for dataset in datasets):
         raise ValueError("validation dataset included in training paths")
-    if config.train.batch % config.train.gpus:
-        raise ValueError(
-            f"train.batch {config.train.batch} must be divisible by train.gpus {config.train.gpus}"
-        )
+    gpus = config.train.gpus if gpus_override is None else gpus_override
+    batch = config.train.batch if batch_override is None else batch_override
+    if gpus <= 0 or batch <= 0:
+        raise ValueError("training GPU count and batch must be positive")
+    if batch % gpus:
+        raise ValueError(f"train.batch {batch} must be divisible by train.gpus {gpus}")
     state_dim, action_dim = _dataset_dimensions(datasets)
     model_limits = Gr00tN1d7Config()
     if state_dim > model_limits.max_state_dim or action_dim > model_limits.max_action_dim:
@@ -460,14 +477,20 @@ def build_train_command(
         raise ValueError(
             f"action horizon {config.action.horizon} exceeds N1.7 limit {model_limits.action_horizon}"
         )
+    if config.train.rtc_training_max_prefix_steps > config.action.horizon - 16:
+        raise ValueError(
+            "rtc_training_max_prefix_steps must leave at least 16 postfix action steps"
+        )
     starts = trainable_starts(datasets, config.action.horizon)
     if starts <= 0:
         raise ValueError("training datasets contain no trainable action windows")
-    steps = (
-        config.train.max_steps
-        if config.train.max_steps is not None
-        else math.ceil(float(config.train.epochs) * starts / config.train.batch)
-    )
+    steps = max_steps_override
+    if steps is None:
+        steps = (
+            config.train.max_steps
+            if config.train.max_steps is not None
+            else math.ceil(float(config.train.epochs) * starts / batch)
+        )
     if steps <= 0:
         raise ValueError(f"derived max_steps must be positive, got {steps}")
 
@@ -478,7 +501,7 @@ def build_train_command(
     else:
         clock = now or (lambda: datetime.now(timezone.utc))
         timestamp = clock().astimezone(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        output_directory = config.train.out_base / f"{config.name}_{timestamp}"
+        output_directory = config.train.out_base / f"{config.name}{output_name_suffix}_{timestamp}"
         if output_directory.exists():
             raise FileExistsError(f"fresh training directory already exists: {output_directory}")
 
@@ -488,7 +511,7 @@ def build_train_command(
         "torch.distributed.run",
         "--standalone",
         "--nproc-per-node",
-        str(config.train.gpus),
+        str(gpus),
         str(REPO_ROOT / "gr00t/experiment/launch_finetune.py"),
         "--base-model-path",
         config.train.base_model,
@@ -499,7 +522,7 @@ def build_train_command(
         "--modality-config-path",
         str(_modality_path(config)),
         "--num-gpus",
-        str(config.train.gpus),
+        str(gpus),
         "--output-dir",
         str(output_directory),
         "--max-steps",
@@ -509,7 +532,7 @@ def build_train_command(
         "--save-total-limit",
         str(config.train.save_total_limit),
         "--global-batch-size",
-        str(config.train.batch),
+        str(batch),
         "--dataloader-num-workers",
         str(config.train.workers),
         "--learning-rate",
@@ -520,6 +543,8 @@ def build_train_command(
         str(config.train.weight_decay),
         "--state-dropout-prob",
         str(config.train.state_dropout_prob),
+        "--rtc-training-max-prefix-steps",
+        str(config.train.rtc_training_max_prefix_steps),
         "--shortest-image-edge",
         str(config.train.shortest_image_edge),
         "--crop-fraction",
@@ -534,6 +559,315 @@ def build_train_command(
     if resume_from is not None:
         command.append("--resume-from-checkpoint")
     return command, output_directory, int(steps), starts
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _git_output(*args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), *args],
+        check=True,
+        capture_output=True,
+        text=False,
+    )
+    return result.stdout.decode("utf-8", errors="replace").strip()
+
+
+def _base_model_revision(model: str) -> str:
+    local = Path(model).expanduser()
+    if local.is_dir():
+        config_path = local / "config.json"
+        if not config_path.is_file():
+            raise ValueError(f"local base model lacks config.json: {local}")
+        return f"local-config-sha256:{_sha256(config_path)}"
+    from huggingface_hub import HfApi, try_to_load_from_cache
+
+    cached = try_to_load_from_cache(model, "config.json")
+    if isinstance(cached, str):
+        parts = Path(cached).parts
+        if "snapshots" in parts:
+            return parts[parts.index("snapshots") + 1]
+    try:
+        return str(HfApi().model_info(model).sha)
+    except Exception as exc:
+        raise RuntimeError(f"could not resolve immutable base-model revision for {model}") from exc
+
+
+def _repository_state() -> tuple[str, str]:
+    repository_diff = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "diff", "--binary", "HEAD"],
+        check=True,
+        capture_output=True,
+    ).stdout
+    return _git_output("rev-parse", "HEAD"), hashlib.sha256(repository_diff).hexdigest()
+
+
+def _artifact_record(path: Path) -> dict[str, object]:
+    stat = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "size_bytes": stat.st_size,
+        "sha256": _sha256(path),
+    }
+
+
+def _source_stat_inventory(config: PipelineConfig) -> list[dict[str, object]]:
+    inventory: list[dict[str, object]] = []
+    for subset in resolve_source_subsets(config):
+        ledger_path = config.output.root / "_ledgers" / f"{config.output_name(subset.name)}.json"
+        if not ledger_path.is_file():
+            raise FileNotFoundError(f"missing conversion ledger: {ledger_path}")
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        if ledger.get("version") != 2:
+            raise ValueError(f"unsupported conversion ledger version: {ledger_path}")
+        for source_key, record in sorted(ledger.get("sources", {}).items()):
+            if record.get("status") != "complete":
+                continue
+            source = subset / source_key
+            if not source.is_file():
+                raise FileNotFoundError(f"admitted source is missing: {source}")
+            stat = source.stat()
+            expected_size = record.get("source_size_bytes")
+            expected_mtime = record.get("source_mtime_ns")
+            if expected_size is None or expected_mtime is None:
+                raise RuntimeError(f"conversion ledger lacks a source stat guard: {source}")
+            if stat.st_size != expected_size or stat.st_mtime_ns != expected_mtime:
+                raise RuntimeError(f"admitted source changed after conversion: {source}")
+            inventory.append(
+                {
+                    "path": str(source.resolve()),
+                    "size_bytes": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                }
+            )
+    return inventory
+
+
+def _bind_missing_source_stat_guards(config: PipelineConfig) -> None:
+    """Bind legacy guard-less ledger rows immediately before the one-time corpus freeze."""
+    for subset in resolve_source_subsets(config):
+        ledger_path = config.output.root / "_ledgers" / f"{config.output_name(subset.name)}.json"
+        if not ledger_path.is_file():
+            raise FileNotFoundError(f"missing conversion ledger: {ledger_path}")
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        changed = False
+        for source_key, record in sorted(ledger.get("sources", {}).items()):
+            if record.get("status") != "complete":
+                continue
+            source = subset / source_key
+            stat = source.stat()
+            expected_size = record.get("source_size_bytes")
+            expected_mtime = record.get("source_mtime_ns")
+            if expected_size is None and expected_mtime is None:
+                record["source_size_bytes"] = stat.st_size
+                record["source_mtime_ns"] = stat.st_mtime_ns
+                changed = True
+            elif expected_size != stat.st_size or expected_mtime != stat.st_mtime_ns:
+                raise RuntimeError(f"admitted source changed after conversion: {source}")
+        if changed:
+            temporary_path = ledger_path.with_name(f".{ledger_path.name}.tmp")
+            temporary_path.write_text(json.dumps(ledger, indent=2, sort_keys=True) + "\n")
+            temporary_path.replace(ledger_path)
+
+
+def _converted_artifact_inventory(
+    config: PipelineConfig, datasets: list[Path]
+) -> list[dict[str, object]]:
+    converted_paths = {
+        path.resolve() for dataset in datasets for path in dataset.rglob("*") if path.is_file()
+    }
+    converted_paths.update(
+        path.resolve() for path in (config.output.root / "_ledgers").glob("*.json")
+    )
+    root_manifest = config.output.root / "manifest.json"
+    if root_manifest.is_file():
+        converted_paths.add(root_manifest.resolve())
+    return [_artifact_record(path) for path in sorted(converted_paths)]
+
+
+def verify_frozen_corpus(manifest_path: Path) -> None:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != 1:
+        raise ValueError(f"unsupported frozen corpus manifest: {manifest_path}")
+    for section in ("pipeline_config", "modality_module"):
+        record = manifest[section]
+        path = Path(record["path"])
+        if path.stat().st_size != record["size_bytes"] or _sha256(path) != record["sha256"]:
+            raise RuntimeError(f"frozen corpus verification failed for {path}")
+    for record in manifest["converted_artifact_inventory"]:
+        path = Path(record["path"])
+        if path.stat().st_size != record["size_bytes"] or _sha256(path) != record["sha256"]:
+            raise RuntimeError(f"frozen corpus verification failed for {path}")
+    for record in manifest["source_stat_inventory"]:
+        stat = Path(record["path"]).stat()
+        if stat.st_size != record["size_bytes"] or stat.st_mtime_ns != record["mtime_ns"]:
+            raise RuntimeError(f"frozen corpus source guard changed: {record['path']}")
+
+
+def freeze_corpus(config: PipelineConfig) -> int:
+    """Validate and freeze one converted corpus against further pipeline writes."""
+    assert_no_incomplete_transactions(config.output.root)
+    manifest_path = frozen_corpus_manifest_path(config.output.root)
+    if manifest_path.exists():
+        verify_frozen_corpus(manifest_path)
+        print(f"frozen corpus manifest is current: {manifest_path}")
+        return 0
+    _bind_missing_source_stat_guards(config)
+    if check_outputs(config, full=True):
+        return 1
+    train_datasets, validation_datasets = find_datasets(config.output.root)
+    datasets = train_datasets + validation_datasets
+    missing = [
+        dataset
+        for dataset in datasets
+        if any(not (dataset / "meta" / filename).exists() for filename in STATS_FILES)
+    ]
+    if missing:
+        raise RuntimeError(f"cannot freeze corpus with missing statistics: {missing}")
+    manifest = {
+        "schema_version": 1,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "pipeline_name": config.name,
+        "pipeline_config": _artifact_record(config.config_path),
+        "modality_module": _artifact_record(_modality_path(config).resolve()),
+        "source_stat_inventory": _source_stat_inventory(config),
+        "converted_artifact_inventory": _converted_artifact_inventory(config, datasets),
+        "datasets": [str(path.resolve()) for path in datasets],
+        "action_horizon": config.action.horizon,
+        "fps": config.source.fps,
+    }
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = manifest_path.with_name(f".{manifest_path.name}.tmp")
+    temporary_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    temporary_path.replace(manifest_path)
+    verify_frozen_corpus(manifest_path)
+    print(f"froze converted corpus: {manifest_path}")
+    return 0
+
+
+def create_training_manifest(
+    config: PipelineConfig,
+    datasets: list[Path],
+    command: list[str],
+    output_directory: Path,
+    *,
+    steps: int,
+    starts: int,
+    batch: int,
+) -> Path:
+    """Write a content-bound fresh-run manifest atomically and verify it."""
+    frozen_manifest = frozen_corpus_manifest_path(config.output.root)
+    if not frozen_manifest.is_file():
+        raise FileNotFoundError(f"training requires a frozen corpus: {frozen_manifest}")
+    verify_frozen_corpus(frozen_manifest)
+    modality_path = _modality_path(config).resolve()
+    repository_revision, repository_diff_sha256 = _repository_state()
+    manifest = {
+        "schema_version": 1,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "pipeline_name": config.name,
+        "pipeline_config": _artifact_record(config.config_path),
+        "modality_module": _artifact_record(modality_path),
+        "source_stat_inventory": _source_stat_inventory(config),
+        "frozen_corpus_manifest": _artifact_record(frozen_manifest),
+        "converted_artifact_inventory": _converted_artifact_inventory(config, datasets),
+        "datasets": [str(path.resolve()) for path in datasets],
+        "action_horizon": config.action.horizon,
+        "fps": config.source.fps,
+        "trainable_starts": starts,
+        "max_steps": steps,
+        "global_batch_size": batch,
+        "effective_epochs": steps * batch / starts,
+        "rtc_prefix_distribution": {
+            "kind": "uniform_integer_inclusive",
+            "minimum": 0,
+            "maximum": config.train.rtc_training_max_prefix_steps,
+        },
+        "base_model": config.train.base_model,
+        "base_model_revision": _base_model_revision(config.train.base_model),
+        "repository_revision": repository_revision,
+        "repository_dirty_diff_sha256": repository_diff_sha256,
+        "command": command,
+    }
+    output_directory.parent.mkdir(parents=True, exist_ok=True)
+    output_directory.mkdir()
+    manifest_path = output_directory / "run_manifest.json"
+    temporary_path = output_directory / ".run_manifest.json.tmp"
+    temporary_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    temporary_path.replace(manifest_path)
+    verify_training_manifest(manifest_path)
+    return manifest_path
+
+
+def verify_training_manifest(manifest_path: Path) -> None:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for section in ("pipeline_config", "modality_module", "frozen_corpus_manifest"):
+        record = manifest[section]
+        path = Path(record["path"])
+        if path.stat().st_size != record["size_bytes"] or _sha256(path) != record["sha256"]:
+            raise RuntimeError(f"training manifest verification failed for {path}")
+    for record in manifest["converted_artifact_inventory"]:
+        path = Path(record["path"])
+        if path.stat().st_size != record["size_bytes"] or _sha256(path) != record["sha256"]:
+            raise RuntimeError(f"training manifest verification failed for {path}")
+    for record in manifest["source_stat_inventory"]:
+        stat = Path(record["path"]).stat()
+        if stat.st_size != record["size_bytes"] or stat.st_mtime_ns != record["mtime_ns"]:
+            raise RuntimeError(f"source stat guard changed before training: {record['path']}")
+
+
+def validate_training_smoke(output_directory: Path, expected_prefix_max: int) -> None:
+    """Reject a nominally successful smoke that did not exercise the requested objective."""
+    saved_config_path = output_directory / "config.json"
+    instantiated_config_path = output_directory / "experiment_cfg/final_model_config.json"
+    checkpoints = sorted(
+        output_directory.glob("checkpoint-*"),
+        key=lambda path: int(path.name.removeprefix("checkpoint-")),
+    )
+    if not checkpoints:
+        raise RuntimeError("training smoke did not save a checkpoint")
+    trainer_state_path = checkpoints[-1] / "trainer_state.json"
+    for path in (saved_config_path, instantiated_config_path, trainer_state_path):
+        if not path.is_file():
+            raise RuntimeError(f"training smoke artifact is missing: {path}")
+    for path in (saved_config_path, instantiated_config_path):
+        saved_config = json.loads(path.read_text(encoding="utf-8"))
+        if saved_config.get("rtc_training_max_prefix_steps", 0) != expected_prefix_max:
+            raise RuntimeError(
+                f"training smoke instantiated RTC prefix maximum "
+                f"{saved_config.get('rtc_training_max_prefix_steps', 0)} instead of "
+                f"{expected_prefix_max}: {path}"
+            )
+
+    trainer_state = json.loads(trainer_state_path.read_text(encoding="utf-8"))
+    log_history = trainer_state.get("log_history", [])
+    losses = [float(row["loss"]) for row in log_history if "loss" in row]
+    postfix_counts = [
+        float(row["rtc_postfix_valid_elements"])
+        for row in log_history
+        if "rtc_postfix_valid_elements" in row
+    ]
+    prefix_counts = {
+        index: sum(float(row.get(f"rtc_prefix_count_{index}", 0.0)) for row in log_history)
+        for index in range(expected_prefix_max + 1)
+    }
+    if not losses or not all(math.isfinite(value) for value in losses):
+        raise RuntimeError("training smoke did not record finite loss")
+    if not postfix_counts or not all(
+        math.isfinite(value) and value > 0 for value in postfix_counts
+    ):
+        raise RuntimeError("training smoke did not record positive postfix coverage")
+    if expected_prefix_max > 0:
+        if prefix_counts[0] <= 0:
+            raise RuntimeError("training smoke did not sample the zero-prefix objective")
+        if sum(count > 0 for count in prefix_counts.values()) < 2:
+            raise RuntimeError("training smoke did not sample varying prefix lengths")
 
 
 def _report_resources(output_base: Path) -> None:
@@ -576,8 +910,24 @@ def _report_resources(output_base: Path) -> None:
         print(f"training output free disk: {usage.free / 1024**3:.1f} GiB at {probe}")
 
 
-def train(config: PipelineConfig, jobs: int | None = None, resume_from: Path | None = None) -> int:
+def train(
+    config: PipelineConfig,
+    jobs: int | None = None,
+    resume_from: Path | None = None,
+    *,
+    smoke_max_steps: int | None = None,
+    smoke_batch: int = 1,
+) -> int:
+    if smoke_max_steps is not None:
+        if resume_from is not None:
+            raise ValueError("smoke launch cannot resume an existing run")
+        if smoke_max_steps <= 0 or smoke_batch <= 0:
+            raise ValueError("smoke_max_steps and smoke_batch must be positive")
     assert_no_incomplete_transactions(config.output.root)
+    frozen_manifest = frozen_corpus_manifest_path(config.output.root)
+    if not frozen_manifest.is_file():
+        raise FileNotFoundError(f"training requires a frozen corpus: {frozen_manifest}")
+    verify_frozen_corpus(frozen_manifest)
     train_datasets, _ = find_datasets(config.output.root)
     if not train_datasets:
         raise ValueError(f"no train datasets under {config.output.root}")
@@ -594,15 +944,45 @@ def train(config: PipelineConfig, jobs: int | None = None, resume_from: Path | N
     for dataset in train_datasets:
         _loader_sample(config, dataset)
     command, output_directory, steps, starts = build_train_command(
-        config, train_datasets, resume_from=resume_from
+        config,
+        train_datasets,
+        resume_from=resume_from,
+        gpus_override=1 if smoke_max_steps is not None else None,
+        batch_override=smoke_batch if smoke_max_steps is not None else None,
+        max_steps_override=smoke_max_steps,
+        output_name_suffix="_smoke" if smoke_max_steps is not None else "",
     )
-    effective_epochs = steps * config.train.batch / starts
+    effective_batch = smoke_batch if smoke_max_steps is not None else config.train.batch
+    effective_epochs = steps * effective_batch / starts
     print(
         f"training datasets={len(train_datasets)} starts={starts} max_steps={steps} "
         f"effective_epochs={effective_epochs:.3f} output={output_directory}"
     )
     print("launch:", " ".join(command))
     _report_resources(config.train.out_base)
+    if resume_from is None:
+        manifest_path = create_training_manifest(
+            config,
+            train_datasets,
+            command,
+            output_directory,
+            steps=steps,
+            starts=starts,
+            batch=effective_batch,
+        )
+        print(f"verified training manifest: {manifest_path}")
+    else:
+        manifest_path = output_directory / "run_manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"resume run lacks run_manifest.json: {output_directory}")
+        verify_training_manifest(manifest_path)
     environment = os.environ.copy()
     environment.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
-    return subprocess.run(command, env=environment, check=False).returncode
+    return_code = subprocess.run(command, env=environment, check=False).returncode
+    if return_code == 0 and smoke_max_steps is not None:
+        validate_training_smoke(
+            output_directory,
+            config.train.rtc_training_max_prefix_steps,
+        )
+        print(f"validated training smoke: {output_directory}")
+    return return_code

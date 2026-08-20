@@ -24,6 +24,8 @@ import math
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7ActionHead
+from gr00t.model.modules.dit import AdaLayerNorm, TimestepEncoder
+from gr00t.model.modules.embodiment_conditioned_mlp import MultiEmbodimentActionEncoder
 import pytest
 import torch
 from transformers.feature_extraction_utils import BatchFeature
@@ -123,6 +125,25 @@ class TestActionHeadForward:
         out = head.forward(_make_backbone_output(config), _make_action_input(config))
         assert torch.isfinite(out["loss"])
 
+    def test_training_prefix_masks_loss_and_reports_coverage(self, monkeypatch):
+        config = _small_config(rtc_training_max_prefix_steps=2)
+        head = Gr00tN1d7ActionHead(config)
+        head.train()
+
+        def fixed_prefix_lengths(low, high, size, *, device):
+            assert (low, high, size) == (0, 3, (2,))
+            return torch.tensor([0, 2], device=device)
+
+        monkeypatch.setattr(torch, "randint", fixed_prefix_lengths)
+        out = head.forward(_make_backbone_output(config), _make_action_input(config))
+
+        assert out["rtc_prefix_lengths"].tolist() == [0, 2]
+        assert torch.count_nonzero(out["action_mask"][1, :2]) == 0
+        assert torch.count_nonzero(out["action_loss"][1, :2]) == 0
+        expected_valid = (2 * config.action_horizon - 2) * config.max_action_dim
+        assert out["rtc_postfix_valid_elements"].item() == expected_valid
+        assert torch.isfinite(out["loss"])
+
 
 class TestActionHeadGetAction:
     """Test inference (denoising loop)."""
@@ -151,6 +172,80 @@ class TestActionHeadGetAction:
             action_input,
         )
         assert out["action_pred"].shape[0] == 1
+
+    def test_native_rtc_keeps_frozen_prefix(self, action_head):
+        head, config = action_head
+        action_input = _make_action_input(config, batch_size=1)
+        previous = action_input["action"].clone()
+        out = head.get_action(
+            _make_backbone_output(config, batch_size=1),
+            action_input,
+            options={
+                "rtc_mode": "native",
+                "action_horizon": config.action_horizon,
+                "rtc_overlap_steps": 2,
+                "rtc_frozen_steps": 1,
+                "rtc_ramp_rate": 6.0,
+            },
+        )
+        torch.testing.assert_close(out["action_pred"][:, :1], previous[:, -2:-1])
+
+    def test_trained_prefix_is_restored_exactly(self):
+        config = _small_config(rtc_training_max_prefix_steps=2)
+        head = Gr00tN1d7ActionHead(config)
+        head.eval()
+        action_input = _make_action_input(config, batch_size=1)
+        prefix = action_input["action"][:, :2].clone()
+        out = head.get_action(
+            _make_backbone_output(config, batch_size=1),
+            action_input,
+            options={"rtc_mode": "trained_prefix", "rtc_prefix_steps": 2},
+        )
+        assert torch.equal(out["action_pred"][:, :2], prefix)
+
+    def test_trained_prefix_rejected_for_old_checkpoint(self, action_head):
+        head, config = action_head
+        with pytest.raises(ValueError, match="not trained"):
+            head.get_action(
+                _make_backbone_output(config),
+                _make_action_input(config),
+                options={"rtc_mode": "trained_prefix", "rtc_prefix_steps": 1},
+            )
+
+
+class TestTokenwiseTimestepConditioning:
+    def test_action_encoder_scalar_and_expanded_timesteps_match(self):
+        encoder = MultiEmbodimentActionEncoder(7, 16, 4)
+        actions = torch.randn(2, 4, 7)
+        timesteps = torch.tensor([100, 200])
+        categories = torch.tensor([0, 1])
+
+        scalar = encoder(actions, timesteps, categories)
+        tokenwise = encoder(actions, timesteps[:, None].expand(-1, 4), categories)
+        assert torch.equal(scalar, tokenwise)
+
+    def test_timestep_encoder_preserves_token_shape(self):
+        encoder = TimestepEncoder(16)
+        timesteps = torch.tensor([[0, 100, 200], [300, 400, 500]])
+        assert encoder(timesteps).shape == (2, 3, 16)
+
+    def test_adalayernorm_accepts_scalar_and_tokenwise_embeddings(self):
+        norm = AdaLayerNorm(16)
+        hidden = torch.randn(2, 4, 16)
+        scalar_embedding = torch.randn(2, 16)
+        scalar = norm(hidden, scalar_embedding)
+        tokenwise = norm(hidden, scalar_embedding[:, None].expand(-1, 4, -1))
+        torch.testing.assert_close(scalar, tokenwise)
+
+
+class TestRtcConfig:
+    @pytest.mark.parametrize("value", [-1, 4])
+    def test_invalid_training_prefix_bound_rejected(self, value):
+        with pytest.raises(ValueError, match="rtc_training_max_prefix_steps"):
+            _small_config(rtc_training_max_prefix_steps=value)
+
+    def test_old_checkpoint_default_is_zero(self):
+        assert _small_config().rtc_training_max_prefix_steps == 0
 
 
 class TestActionHeadEncodeFeatures:

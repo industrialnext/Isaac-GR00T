@@ -15,6 +15,7 @@ from .adapter import (
     build_model_observation,
     build_synthetic_model_observation,
     map_action_chunk,
+    map_wire_action_prefix,
     snapshot_is_fresh,
 )
 from .async_server import IndustrialNextAsyncServer, IndustrialNextServingConfig
@@ -38,5 +39,6 @@ __all__ = [
     "build_synthetic_model_observation",
     "load_task_catalog",
     "map_action_chunk",
+    "map_wire_action_prefix",
     "snapshot_is_fresh",
 ]

@@ -474,13 +474,15 @@ def test_inspection_separates_selection_warnings_and_gap_segments(tmp_path: Path
     config_path, source_root, _ = _test_config(tmp_path, gap_ms=40)
     subset = source_root / "source_one"
     accepted = subset / "robot/2026/08/18/episode_ok_expert/episode.h5"
-    _write_episode(accepted, frame_count=90, valid_for_training=None, gap_at=45)
+    _write_episode(accepted, frame_count=90, valid_for_training=True, gap_at=45)
     config = load_config(config_path)
     description = inspect_source(config, subset, accepted)
     assert description.segments == ((0, 45), (45, 90))
-    assert any(
-        "valid_for_training measurement unavailable" in item for item in description.warnings
-    )
+
+    missing = subset / "robot/2026/08/18/episode_missing_expert/episode.h5"
+    _write_episode(missing, valid_for_training=None)
+    missing_description = inspect_source(config, subset, missing)
+    assert missing_description.skip_reason == "valid_for_training is missing"
 
     rejected = subset / "robot/2026/08/18/episode_bad_expert/episode.h5"
     _write_episode(rejected, valid_for_training=False)
@@ -1002,6 +1004,7 @@ def test_training_command_covers_epoch_max_steps_wandb_fresh_and_resume(
             max_steps=None,
             use_wandb=True,
             wandb_project="test-project",
+            rtc_training_max_prefix_steps=3,
         ),
     )
     instant = datetime(2026, 8, 19, 12, 34, 56, tzinfo=timezone.utc)
@@ -1024,6 +1027,7 @@ def test_training_command_covers_epoch_max_steps_wandb_fresh_and_resume(
     )
     assert command[command.index("--max-steps") + 1] == str(steps)
     assert command[command.index("--wandb-project") + 1] == "test-project"
+    assert command[command.index("--rtc-training-max-prefix-steps") + 1] == "3"
     assert "--use-wandb" in command
     assert "--experiment-name" not in command
     assert "--resume-from-checkpoint" not in command
@@ -1050,6 +1054,72 @@ def test_training_command_covers_epoch_max_steps_wandb_fresh_and_resume(
         check_module.build_train_command(config, datasets, now=lambda: instant)
 
 
+def test_training_manifest_binds_converted_content_and_source_stats(tmp_path: Path, monkeypatch):
+    config, output_root = _synced_test_output(tmp_path, monkeypatch, episodes_per_subset=1)
+    datasets, _ = check_module.find_datasets(output_root)
+    for dataset in datasets:
+        for filename in check_module.STATS_FILES:
+            (dataset / "meta" / filename).write_text("{}\n")
+    monkeypatch.setattr(check_module, "check_outputs", lambda config, full: 0)
+    assert check_module.freeze_corpus(config) == 0
+    monkeypatch.setattr(check_module, "_base_model_revision", lambda model: "test-revision")
+    monkeypatch.setattr(check_module, "_repository_state", lambda: ("test-head", "diff-hash"))
+    output_directory = tmp_path / "training" / "run"
+    command = ["train", "--deterministic-test"]
+
+    manifest_path = check_module.create_training_manifest(
+        config,
+        datasets,
+        command,
+        output_directory,
+        steps=2,
+        starts=11,
+        batch=1,
+    )
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["base_model_revision"] == "test-revision"
+    assert manifest["command"] == command
+    assert manifest["source_stat_inventory"]
+    assert manifest["converted_artifact_inventory"]
+    check_module.verify_training_manifest(manifest_path)
+
+    bound_artifact = Path(manifest["converted_artifact_inventory"][0]["path"])
+    bound_artifact.write_bytes(bound_artifact.read_bytes() + b"mutation")
+    with pytest.raises(RuntimeError, match="verification failed"):
+        check_module.verify_training_manifest(manifest_path)
+
+
+def test_freeze_manifest_blocks_pipeline_writes(tmp_path: Path, monkeypatch):
+    config, output_root = _synced_test_output(tmp_path, monkeypatch, episodes_per_subset=1)
+    datasets, _ = check_module.find_datasets(output_root)
+    for dataset in datasets:
+        for filename in check_module.STATS_FILES:
+            (dataset / "meta" / filename).write_text("{}\n")
+    monkeypatch.setattr(check_module, "check_outputs", lambda config, full: 0)
+
+    assert check_module.freeze_corpus(config) == 0
+    assert check_module.freeze_corpus(config) == 0
+    with pytest.raises(RuntimeError, match="converted corpus is frozen"):
+        sync_config(config, workers=1)
+
+    (datasets[0] / "meta/stats.json").write_text("mutated\n")
+    with pytest.raises(RuntimeError, match="frozen corpus verification failed"):
+        check_module.verify_frozen_corpus(check_module.frozen_corpus_manifest_path(output_root))
+
+
+def test_freeze_rejects_source_changed_after_conversion(tmp_path: Path, monkeypatch):
+    config, output_root = _synced_test_output(tmp_path, monkeypatch, episodes_per_subset=1)
+    datasets, _ = check_module.find_datasets(output_root)
+    for dataset in datasets:
+        for filename in check_module.STATS_FILES:
+            (dataset / "meta" / filename).write_text("{}\n")
+    source = next(resolve_source_subsets(config)[0].glob(config.source.episode_glob))
+    source.touch()
+
+    with pytest.raises(RuntimeError, match="source changed after conversion"):
+        check_module.freeze_corpus(config)
+
+
 def test_resource_reporting_is_advisory_for_malformed_gpu_output_and_missing_output_path(
     tmp_path: Path, monkeypatch, capsys
 ):
@@ -1065,6 +1135,33 @@ def test_resource_reporting_is_advisory_for_malformed_gpu_output_and_missing_out
     captured = capsys.readouterr()
     assert "ignoring malformed nvidia-smi output" in captured.err
     assert "training output free disk" in captured.out
+
+
+def test_training_smoke_validation_requires_wired_rtc_and_objective_coverage(tmp_path: Path):
+    output = tmp_path / "smoke"
+    checkpoint = output / "checkpoint-30"
+    experiment = output / "experiment_cfg"
+    checkpoint.mkdir(parents=True)
+    experiment.mkdir()
+    (output / "config.json").write_text('{"rtc_training_max_prefix_steps": 3}\n')
+    (experiment / "final_model_config.json").write_text('{"rtc_training_max_prefix_steps": 3}\n')
+    state = {
+        "log_history": [
+            {"loss": 1.0},
+            {
+                "rtc_postfix_valid_elements": 100.0,
+                "rtc_prefix_count_0": 2.0,
+                "rtc_prefix_count_1": 3.0,
+            },
+        ]
+    }
+    (checkpoint / "trainer_state.json").write_text(json.dumps(state))
+
+    check_module.validate_training_smoke(output, 3)
+
+    (experiment / "final_model_config.json").write_text('{"rtc_training_max_prefix_steps": 0}\n')
+    with pytest.raises(RuntimeError, match="instead of 3"):
+        check_module.validate_training_smoke(output, 3)
 
 
 def test_existing_layout_rejects_semantic_or_chunk_change_without_new_sources(

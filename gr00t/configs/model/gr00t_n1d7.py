@@ -108,6 +108,7 @@ class Gr00tN1d7Config(PretrainedConfig):
     noise_beta_beta: float = 1.0
     noise_s: float = 0.999
     num_timestep_buckets: int = 1000
+    rtc_training_max_prefix_steps: int = 0
 
     # Training parameters
     tune_projector: bool = True
@@ -136,6 +137,17 @@ class Gr00tN1d7Config(PretrainedConfig):
                     setattr(self, f.name, f.default)
                 elif getattr(f, "default_factory", MISSING) is not MISSING:
                     setattr(self, f.name, f.default_factory())
+
+        if isinstance(self.rtc_training_max_prefix_steps, bool) or not isinstance(
+            self.rtc_training_max_prefix_steps, int
+        ):
+            raise TypeError("rtc_training_max_prefix_steps must be an integer")
+        if not 0 <= self.rtc_training_max_prefix_steps < self.action_horizon:
+            raise ValueError(
+                "rtc_training_max_prefix_steps must satisfy "
+                f"0 <= value < action_horizon ({self.action_horizon}), got "
+                f"{self.rtc_training_max_prefix_steps}"
+            )
 
     def to_filtered_dict(self, exclude_augment: bool = True) -> dict:
         """Return a dictionary representation of this config, optionally excluding augmentation keys."""

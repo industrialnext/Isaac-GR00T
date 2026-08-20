@@ -114,6 +114,7 @@ class TrainingConfig:
     wandb_project: str = "finetune-gr00t-n1d7"
     weight_decay: float = 1e-5
     warmup_ratio: float = 0.05
+    rtc_training_max_prefix_steps: int = 0
 
 
 @dataclass(frozen=True)
@@ -479,11 +480,17 @@ def load_config(path: str | Path) -> PipelineConfig:
             "wandb_project",
             "weight_decay",
             "warmup_ratio",
+            "rtc_training_max_prefix_steps",
         },
         "train",
     )
     color_jitter = _mapping(train_raw.get("color_jitter", {}), "train.color_jitter")
     epochs_raw = train_raw.get("epochs", 1.0)
+    rtc_training_max_prefix_steps = train_raw.get("rtc_training_max_prefix_steps", 0)
+    if isinstance(rtc_training_max_prefix_steps, bool) or not isinstance(
+        rtc_training_max_prefix_steps, int
+    ):
+        raise ValueError("train.rtc_training_max_prefix_steps must be an integer")
     train = TrainingConfig(
         base_model=_string(train_raw.get("base_model", "nvidia/GR00T-N1.7-3B"), "train.base_model"),
         out_base=_path(train_raw.get("out_base", "outputs"), "train.out_base"),
@@ -505,6 +512,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         ),
         weight_decay=float(train_raw.get("weight_decay", 1e-5)),
         warmup_ratio=float(train_raw.get("warmup_ratio", 0.05)),
+        rtc_training_max_prefix_steps=rtc_training_max_prefix_steps,
     )
     if train.gpus <= 0 or train.batch <= 0 or train.workers < 0:
         raise ValueError(
@@ -512,6 +520,14 @@ def load_config(path: str | Path) -> PipelineConfig:
         )
     if train.max_steps is None and (train.epochs is None or train.epochs <= 0):
         raise ValueError("train requires positive epochs or max_steps")
+    if (
+        train.rtc_training_max_prefix_steps < 0
+        or train.rtc_training_max_prefix_steps >= action_layout.horizon
+    ):
+        raise ValueError(
+            "train.rtc_training_max_prefix_steps must satisfy "
+            f"0 <= value < action.horizon ({action_layout.horizon})"
+        )
 
     return PipelineConfig(
         name=name,

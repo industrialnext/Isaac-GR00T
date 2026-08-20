@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "created_at_utc": "2026-08-20T01:08:00Z",
+  "selected_checkpoint": "outputs/gr00t/semihumanoid_20260819_230043/checkpoint-3496",
+  "selection_basis": {
+    "held_out_datasets": [
+      "ube_v1_val",
+      "ube_v2_val",
+      "ube_v3_val",
+      "ube_v4_val"
+    ],
+    "trajectory_ids": [0, 1, 2],
+    "open_loop_steps_per_trajectory": 100,
+    "replay_steps_per_trajectory": 100,
+    "delay_trace_steps": [4, 4, 5, 4, 6, 4],
+    "candidate_reports": "artifacts/semihumanoid_rtc_candidates_20260820",
+    "corrected_replay_reports": "artifacts/semihumanoid_rtc_candidates_20260820_v2"
+  },
+  "candidates": {
+    "checkpoint-1000": {
+      "open_loop": {"mse": 0.0002179587997185687, "mae": 0.008748707128688693},
+      "off_replay": {"mse": 0.0002828532612208316, "mae": 0.008381615586889287},
+      "native_replay": {"mse": 0.00012564915565841753, "mae": 0.0064922639867290854, "position_seam_p99_max_m": 0.01699341063387692},
+      "trained_prefix_replay": {"mse": 0.0029137251840438694, "mae": 0.031677172519266605, "position_seam_p99_max_m": 0.0536230181157589}
+    },
+    "checkpoint-2000": {
+      "open_loop": {"mse": 0.00016270594975746158, "mae": 0.0072930025635287166},
+      "off_replay": {"mse": 0.00013718850853668604, "mae": 0.00697048307241251},
+      "native_replay": {"mse": 0.00008986898834943229, "mae": 0.005745355039834976, "position_seam_p99_max_m": 0.018320849649608135},
+      "trained_prefix_replay": {"mse": 0.0019480351814612125, "mae": 0.027166244263450306, "position_seam_p99_max_m": 0.04128431910648943}
+    },
+    "checkpoint-3000": {
+      "open_loop": {"mse": 0.00017990403557632817, "mae": 0.0056844697101041675},
+      "off_replay": {"mse": 0.00008635291169412085, "mae": 0.005220200730642925},
+      "native_replay": {"mse": 0.00008502703030899283, "mae": 0.004625638326009114, "position_seam_p99_max_m": 0.0203771885111928},
+      "trained_prefix_replay": {"mse": 0.0015051109900620456, "mae": 0.02394499738390247, "position_seam_p99_max_m": 0.04761663038283587}
+    },
+    "checkpoint-3496": {
+      "open_loop": {"mse": 0.00010797141900790545, "mae": 0.0054796788026578724},
+      "off_replay": {"mse": 0.00019696863273566123, "mae": 0.005083802466591199},
+      "native_replay": {"mse": 0.00008606549317846657, "mae": 0.004631798927827428, "position_seam_p99_max_m": 0.025346639622002842},
+      "trained_prefix_replay": {"mse": 0.0015264506024929385, "mae": 0.02369667946671446, "position_seam_p99_max_m": 0.048113261386752135}
+    }
+  },
+  "shared_corrected_replay_invariants": {
+    "target_timestep_coverage": 0.96,
+    "hold_rate": 0.0,
+    "rejections": 0,
+    "prefix_position_error_max_m": 0.0,
+    "prefix_orientation_error_max_rad": 4.2146848510894035e-08,
+    "prefix_gripper_error_max": 0.0
+  },
+  "decision": {
+    "checkpoint": "checkpoint-3496",
+    "reason": "Best aggregate held-out open-loop MSE and MAE, best trained-prefix replay MAE, and best off replay MAE. Checkpoint-3000 is marginally better in native replay, but not enough to displace the broader held-out result.",
+    "deployment_shadow_frontrunner": "native",
+    "motion_default": null,
+    "mode_caveat": "Trained-prefix passes protocol and prefix-invariance gates but is materially less accurate than native and off in the bounded replay. Deployment must compare all modes in no-motion shadow; no RTC mode is authorized for motion by this selection."
+  }
+}

@@ -63,6 +63,10 @@ class FinetuneConfig:
     Dropout probability applied to state inputs for regularization during training.
     """
 
+    rtc_training_max_prefix_steps: int = 0
+    """Inclusive maximum clean action-prefix length sampled during training. Zero disables
+    training-time prefix conditioning and preserves the original objective."""
+
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None
     """Maximum rotation angle (in degrees) for random rotation augmentation of input images."""
@@ -197,6 +201,12 @@ class FinetuneConfig:
     Useful for CI/testing to skip the slow checkpoint shard loading."""
 
     def __post_init__(self) -> None:
+        if isinstance(self.rtc_training_max_prefix_steps, bool) or not isinstance(
+            self.rtc_training_max_prefix_steps, int
+        ):
+            raise TypeError("rtc_training_max_prefix_steps must be an integer")
+        if self.rtc_training_max_prefix_steps < 0:
+            raise ValueError("rtc_training_max_prefix_steps must be >= 0")
         if self.gradient_accumulation_steps < 1:
             raise ValueError(
                 f"gradient_accumulation_steps must be >= 1, got {self.gradient_accumulation_steps}"

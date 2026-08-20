@@ -1,0 +1,191 @@
+{
+  "checkpoint_rtc_training_max_prefix_steps": 12,
+  "config": {
+    "control_hz": 50.0,
+    "dataset_path": null,
+    "delay_trace": [
+      4,
+      4,
+      5,
+      4,
+      6,
+      4
+    ],
+    "device": "cuda",
+    "embodiment_tag": "new_embodiment",
+    "min_new_tail_steps": 16,
+    "modes": [
+      "off",
+      "native",
+      "trained_prefix"
+    ],
+    "native_overlap_steps": 12,
+    "prefix_steps": 12,
+    "replay_steps": 100,
+    "rtc_gripper_tolerance": 0.0001,
+    "rtc_orientation_tolerance_rad": 0.001,
+    "rtc_position_tolerance": 0.0001,
+    "rtc_ramp_rate": 6.0,
+    "run_latency": true,
+    "run_replay": false,
+    "seeds": [
+      0,
+      1,
+      2
+    ],
+    "steady_calls": 100,
+    "task_text": "Pick the grounded target object.",
+    "trajectory_ids": [
+      0
+    ],
+    "warmup_calls": 5
+  },
+  "latency": {
+    "native": {
+      "decode_ms": {
+        "max": 6.332661956548691,
+        "mean": 6.10677043790929,
+        "p50": 6.096620578318834,
+        "p95": 6.209700583713129,
+        "p99": 6.285488500725478
+      },
+      "generation_ms": {
+        "max": 52.9457819648087,
+        "mean": 51.664787852205336,
+        "p50": 51.58638849388808,
+        "p95": 52.506832988001406,
+        "p99": 52.93041725526564
+      },
+      "p99_committed_steps_sizing_proxy": 4,
+      "preprocessing_ms": {
+        "max": 10.886691976338625,
+        "mean": 9.953553972300142,
+        "p50": 9.923386038281024,
+        "p95": 10.171815537614748,
+        "p99": 10.293312690919269
+      },
+      "status": "ok",
+      "steady_calls": 100,
+      "total_ms": {
+        "max": 69.90230595692992,
+        "mean": 67.75210690451786,
+        "p50": 67.62050004908815,
+        "p95": 68.8453709881287,
+        "p99": 69.33569536893629
+      },
+      "warmup_total_ms": [
+        68.00263200420886,
+        67.54122895654291,
+        67.73502100259066,
+        67.55134998820722,
+        67.66363000497222
+      ]
+    },
+    "off": {
+      "decode_ms": {
+        "max": 6.405272055417299,
+        "mean": 6.108008063165471,
+        "p50": 6.0974955558776855,
+        "p95": 6.231190520338714,
+        "p99": 6.34349696803838
+      },
+      "generation_ms": {
+        "max": 52.3325779940933,
+        "mean": 50.544794159941375,
+        "p50": 50.48758094199002,
+        "p95": 51.24424804234877,
+        "p99": 51.47084638942034
+      },
+      "p99_committed_steps_sizing_proxy": 4,
+      "preprocessing_ms": {
+        "max": 2.8479190077632666,
+        "mean": 2.5508838379755616,
+        "p50": 2.5293019716627896,
+        "p95": 2.767168584978208,
+        "p99": 2.837227041600272
+      },
+      "status": "ok",
+      "steady_calls": 100,
+      "total_ms": {
+        "max": 61.2536579137668,
+        "mean": 59.22968342085369,
+        "p50": 59.13014354882762,
+        "p95": 60.11638246127404,
+        "p99": 60.38082750630566
+      },
+      "warmup_total_ms": [
+        61.43545906525105,
+        59.76384808309376,
+        59.64626697823405,
+        59.65465703047812,
+        59.61959599517286
+      ]
+    },
+    "trained_prefix": {
+      "decode_ms": {
+        "max": 7.153337937779725,
+        "mean": 6.067862270865589,
+        "p50": 6.045464950148016,
+        "p95": 6.141435110475868,
+        "p99": 6.4456117444206065
+      },
+      "generation_ms": {
+        "max": 54.819775046780705,
+        "mean": 51.49022525292821,
+        "p50": 51.29498150199652,
+        "p95": 53.78260853467509,
+        "p99": 54.26987656974234
+      },
+      "p99_committed_steps_sizing_proxy": 4,
+      "preprocessing_ms": {
+        "max": 11.44362601917237,
+        "mean": 9.935946227051318,
+        "p50": 9.876785974483937,
+        "p95": 10.339149466017261,
+        "p99": 10.743444513063881
+      },
+      "status": "ok",
+      "steady_calls": 100,
+      "total_ms": {
+        "max": 71.84797897934914,
+        "mean": 67.52051582909189,
+        "p50": 67.26470298599452,
+        "p95": 70.0292126275599,
+        "p99": 71.13461965462193
+      },
+      "warmup_total_ms": [
+        67.35724909231067,
+        67.32589809689671,
+        67.31691805180162,
+        67.38786899950355,
+        67.06986704375595
+      ]
+    }
+  },
+  "model_path": "/mnt/data/ml_data/outputs/gr00t/semihumanoid_20260819_230043/checkpoint-3496",
+  "provenance": {
+    "checkpoint_action_horizon": 40,
+    "checkpoint_config_sha256": "ca2c610c837aeaa42ece34b4d34c0ad6465bc8e7817c7f398f3d3a735286428e",
+    "checkpoint_model_type": "Gr00tN1d7",
+    "checkpoint_rtc_training_max_prefix_steps": 12,
+    "groot_revision": "709a031151f58a904a7083d3957140822632d371",
+    "industrialnext_rpc_revision": "c3dc583ee36310581ad1ec154559698051988b9f",
+    "model_index_sha256": "407804ea5a62f4f8823f48811ae0edbb82fac101e9cf4d7273e6e2f692bb4d59",
+    "model_path": "/mnt/data/ml_data/outputs/gr00t/semihumanoid_20260819_230043/checkpoint-3496",
+    "model_shards": [
+      {
+        "name": "model-00001-of-00002.safetensors",
+        "sha256": "8d498904643b69ea997129a4f93bc40c61a880b457ebe2f51d2eeb03903dc0b5",
+        "size_bytes": 4990519232
+      },
+      {
+        "name": "model-00002-of-00002.safetensors",
+        "sha256": "ed2033c4d5ee828c47b8fa9cf529f9d1fc941b26f1c76ce54425e54609bb29fb",
+        "size_bytes": 1919980184
+      }
+    ],
+    "processor_config_sha256": "6ca23beee713034452d850b3096b6981eb209211e19656102b96bfd49865cb42"
+  },
+  "replay": null,
+  "schema_version": 1
+}

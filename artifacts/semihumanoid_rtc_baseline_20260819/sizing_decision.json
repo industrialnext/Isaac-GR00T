@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "decision_date_utc": "2026-08-19",
+  "control_hz": 50,
+  "checkpoint": "outputs/gr00t/semihumanoid_20260819_080107",
+  "measured": {
+    "steady_state_calls_per_mode": 100,
+    "warmup_calls_per_mode": 5,
+    "off_total_p99_ms": 62.80,
+    "native_total_p99_ms": 70.42,
+    "p99_steps_proxy": 4
+  },
+  "training_capacity": {
+    "measured_p99_steps": 4,
+    "reviewed_deployment_and_load_envelope_steps": 8,
+    "rtc_training_max_prefix_steps": 12,
+    "action_horizon_steps": 40,
+    "postfix_steps_at_maximum": 28
+  },
+  "provisional_runtime": {
+    "rtc_initial_frozen_steps": 4,
+    "rtc_delay_window_size": 20,
+    "rtc_delay_margin_steps": 2,
+    "rtc_max_prefix_steps": 12,
+    "rtc_native_overlap_steps": 12,
+    "rtc_min_new_tail_steps": 16
+  },
+  "evidence_status": {
+    "latency": "directly measured on the intended RTX 4090 GPU",
+    "p99_steps_proxy": "derived with ceil(total_ms * control_hz / 1000)",
+    "training_capacity": "reviewed planning bound pending deployment-machine shadow data",
+    "runtime_parameters": "provisional and must be revalidated on the deployment machine"
+  }
+}

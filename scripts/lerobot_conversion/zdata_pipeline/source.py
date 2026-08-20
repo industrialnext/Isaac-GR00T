@@ -32,6 +32,8 @@ class SourceDescription:
     segments: tuple[tuple[int, int], ...]
     warnings: tuple[str, ...]
     skip_reason: str | None = None
+    source_size_bytes: int | None = None
+    source_mtime_ns: int | None = None
 
 
 @dataclass(frozen=True)
@@ -221,13 +223,25 @@ def inspect_source(config: PipelineConfig, subset: Path, source: Path) -> Source
     key = episode_key(subset, source)
     policy_type = _policy_type(source)
     warning_messages: list[str] = []
+    source_stat = source.stat()
     with h5py.File(source, "r") as h5:
         frame_count = int(h5.attrs.get("frame_count", 0))
         if frame_count <= 0:
             raise ValueError(f"frame_count must be positive, got {frame_count}")
         if config.select.require_valid_for_training:
             if "valid_for_training" not in h5.attrs:
-                warning_messages.append("valid_for_training measurement unavailable; accepting")
+                return SourceDescription(
+                    path=source,
+                    key=key,
+                    task_id=None,
+                    task_text=None,
+                    frame_count=frame_count,
+                    policy_type=policy_type,
+                    layout=None,
+                    segments=(),
+                    warnings=(),
+                    skip_reason="valid_for_training is missing",
+                )
             elif not bool(h5.attrs["valid_for_training"]):
                 return SourceDescription(
                     path=source,
@@ -351,6 +365,12 @@ def inspect_source(config: PipelineConfig, subset: Path, source: Path) -> Source
 
         task_id = _attr_text(h5.attrs, config.tasks.id_attr)
         task_text = _attr_text(h5.attrs, config.tasks.text_attr)
+        current_stat = source.stat()
+        if (
+            current_stat.st_size != source_stat.st_size
+            or current_stat.st_mtime_ns != source_stat.st_mtime_ns
+        ):
+            raise RuntimeError("source changed while it was being inspected")
         return SourceDescription(
             path=source,
             key=key,
@@ -361,6 +381,8 @@ def inspect_source(config: PipelineConfig, subset: Path, source: Path) -> Source
             layout=layout,
             segments=usable_segments,
             warnings=tuple(warning_messages),
+            source_size_bytes=source_stat.st_size,
+            source_mtime_ns=source_stat.st_mtime_ns,
         )
 
 

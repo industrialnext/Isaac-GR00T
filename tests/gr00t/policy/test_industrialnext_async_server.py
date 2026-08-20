@@ -35,11 +35,14 @@ class _FakePolicy:
             self.release.set()
         self.fail = fail
         self.call_count = 0
+        self.options_history: list[dict[str, Any]] = []
+        self.echo_prefix = True
 
     def get_action(
         self, observation: dict[str, Any], options: dict[str, Any] | None = None
     ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-        del options
+        options = {} if options is None else options
+        self.options_history.append(options)
         assert observation["language"]["annotation.human.task_description"] == [[TASK_TEXT]]
         self.call_count += 1
         self.started.set()
@@ -47,7 +50,13 @@ class _FakePolicy:
             raise TimeoutError("test did not release fake inference")
         if self.fail:
             raise RuntimeError("synthetic inference failure")
-        return _decoded_action(), {}
+        action = _decoded_action()
+        if self.echo_prefix and options.get("rtc_mode") in {"native", "trained_prefix"}:
+            prefix = options["action_prefix"]
+            prefix_steps = next(iter(prefix.values())).shape[1]
+            for key, value in prefix.items():
+                action[key][:, :prefix_steps] = value
+        return action, {"rtc_mode": options.get("rtc_mode", "off")}
 
 
 def _catalog() -> TaskCatalog:
@@ -65,6 +74,7 @@ def _server(
     max_staleness_steps: int = 5,
     min_usable_action_steps: int = 1,
     idle_session_timeout_s: float = 300.0,
+    **config_overrides: Any,
 ) -> IndustrialNextAsyncServer:
     return IndustrialNextAsyncServer(
         policy=policy,
@@ -75,6 +85,7 @@ def _server(
             min_usable_action_steps=min_usable_action_steps,
             idle_session_timeout_s=idle_session_timeout_s,
             stats_log_interval_steps=0,
+            **config_overrides,
         ),
         service_provenance={"model_path": "/test/model"},
         embodiment_tag="new_embodiment",
@@ -349,10 +360,12 @@ def test_inference_failure_and_minimum_tail_are_fail_closed() -> None:
             await _wait_until(lambda: server._inference_future is None)
             response = _step(server, session_id)
             assert response["action"] is None
-            # The failed call is reported while this accepted step immediately retries.
-            assert response["inference_status"] == "running"
-            assert response["monitoring"]["null_reason"] == "inference_error"
+            assert response["inference_status"] == "reregistration_required"
+            assert response["monitoring"]["null_reason"] == "reregistration_required"
+            assert response["monitoring"]["requires_reregistration"] is True
             assert "synthetic inference failure" in response["monitoring"]["latest_inference_error"]
+            replacement = _register(server)
+            assert replacement != session_id
         finally:
             await server.shutdown()
 
@@ -407,5 +420,162 @@ def test_cancelled_shutdown_still_closes_the_inference_executor() -> None:
             await shutdown_task
         with pytest.raises(RuntimeError, match="cannot schedule new futures after shutdown"):
             server.executor.submit(lambda: None)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("rtc_mode", ["native", "trained_prefix"])
+def test_rtc_refresh_uses_launch_time_contiguous_prefix(rtc_mode: str) -> None:
+    async def scenario() -> None:
+        policy = _FakePolicy(initially_released=True)
+        server = _server(
+            policy,
+            rtc_mode=rtc_mode,
+            rtc_initial_frozen_steps=1,
+            rtc_delay_margin_steps=0,
+            rtc_max_prefix_steps=4,
+            rtc_native_overlap_steps=4,
+            rtc_min_new_tail_steps=16,
+        )
+        try:
+            session_id = _register(server)
+            _step(server, session_id, include_images=True)
+            await _wait_until(lambda: server._inference_future is None)
+
+            served = _step(server, session_id)
+            assert served["action"]["left_arm_pose_pos"][0] == 1.0
+            await _wait_until(lambda: server._inference_future is None)
+            assert len(policy.options_history) == 2
+            rtc_options = policy.options_history[1]
+            assert rtc_options["rtc_mode"] == rtc_mode
+            if rtc_mode == "native":
+                assert rtc_options["rtc_frozen_steps"] == 1
+                assert rtc_options["rtc_overlap_steps"] == 4
+                assert rtc_options["action_prefix"]["left_eef"].shape == (1, 4, 9)
+            else:
+                assert rtc_options["rtc_prefix_steps"] == 1
+                assert rtc_options["action_prefix"]["left_eef"].shape == (1, 1, 9)
+            assert server._active_session is not None
+            assert server._active_session.inference_status == "ready"
+            assert server._active_session.latest_prefix_position_error == 0.0
+            assert server._active_session.served_history[1]["left_arm_pose_pos"][0] == 1.0
+        finally:
+            await server.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_rtc_delay_underestimate_rejects_result_without_replacing_timeline() -> None:
+    async def scenario() -> None:
+        policy = _FakePolicy(initially_released=True)
+        server = _server(
+            policy,
+            max_staleness_steps=0,
+            rtc_mode="trained_prefix",
+            rtc_initial_frozen_steps=1,
+            rtc_delay_margin_steps=0,
+            rtc_max_prefix_steps=4,
+            rtc_native_overlap_steps=4,
+            rtc_min_new_tail_steps=16,
+        )
+        try:
+            session_id = _register(server)
+            _step(server, session_id, include_images=True)
+            await _wait_until(lambda: server._inference_future is None)
+            policy.release.clear()
+
+            _step(server, session_id, include_images=True)
+            await _wait_until(lambda: policy.call_count == 2)
+            _step(server, session_id)
+            old_target = min(server._active_session.timeline)  # type: ignore[union-attr]
+            policy.release.set()
+            await _wait_until(lambda: server._inference_future is None)
+
+            assert server._active_session is not None
+            assert server._active_session.inference_status == "delay_underestimate"
+            assert server._active_session.stats.rejected_delay_underestimates == 1
+            assert min(server._active_session.timeline) == old_target
+        finally:
+            policy.release.set()
+            await server.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_rtc_missing_contiguous_prefix_does_not_launch_inference() -> None:
+    async def scenario() -> None:
+        policy = _FakePolicy(initially_released=True)
+        server = _server(
+            policy,
+            rtc_mode="trained_prefix",
+            rtc_initial_frozen_steps=4,
+            rtc_delay_margin_steps=0,
+            rtc_max_prefix_steps=4,
+            rtc_native_overlap_steps=4,
+            rtc_min_new_tail_steps=16,
+        )
+        try:
+            session_id = _register(server)
+            _step(server, session_id, include_images=True)
+            await _wait_until(lambda: server._inference_future is None)
+            assert server._active_session is not None
+            del server._active_session.timeline[2]
+
+            response = _step(server, session_id)
+
+            assert response["inference_status"] == "missing_prefix"
+            assert policy.call_count == 1
+            assert server._active_session.stats.missing_prefixes == 1
+            assert server._active_session.timeline
+        finally:
+            await server.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_rtc_prefix_mismatch_is_rejected_atomically() -> None:
+    async def scenario() -> None:
+        policy = _FakePolicy(initially_released=True)
+        server = _server(
+            policy,
+            rtc_mode="native",
+            rtc_initial_frozen_steps=1,
+            rtc_delay_margin_steps=0,
+            rtc_max_prefix_steps=4,
+            rtc_native_overlap_steps=4,
+            rtc_min_new_tail_steps=16,
+        )
+        try:
+            session_id = _register(server)
+            _step(server, session_id, include_images=True)
+            await _wait_until(lambda: server._inference_future is None)
+            policy.echo_prefix = False
+            _step(server, session_id)
+            await _wait_until(lambda: server._inference_future is None)
+            assert server._active_session is not None
+            assert server._active_session.inference_status == "prefix_mismatch"
+            assert server._active_session.stats.rejected_prefix_mismatches == 1
+            assert server._active_session.timeline
+        finally:
+            await server.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_action_dynamics_limit_rejects_without_clipping_output() -> None:
+    async def scenario() -> None:
+        policy = _FakePolicy(initially_released=True)
+        server = _server(policy, max_position_step_m=0.5)
+        try:
+            session_id = _register(server)
+            _step(server, session_id, include_images=True)
+            await _wait_until(lambda: server._inference_future is None)
+            assert server._active_session is not None
+            assert server._active_session.timeline == {}
+            assert server._active_session.inference_status == "action_dynamics_limit"
+            assert server._active_session.stats.rejected_dynamics == 1
+            assert server._active_session.requires_reregistration is True
+        finally:
+            await server.shutdown()
 
     asyncio.run(scenario())

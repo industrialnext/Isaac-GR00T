@@ -23,6 +23,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from gr00t.data.types import ModalityConfig
+from gr00t.policy.gr00t_policy import _restore_physical_hard_prefix
 import numpy as np
 import pytest
 import torch
@@ -129,6 +130,28 @@ def _make_observation(batch_size=1):
     }
 
 
+@pytest.mark.parametrize(
+    ("mode", "hard_steps"),
+    (("off", 0), ("native", 2), ("trained_prefix", 3)),
+)
+def test_physical_hard_prefix_restoration_does_not_touch_generated_tail(
+    mode: str, hard_steps: int
+) -> None:
+    action = {"eef": np.zeros((1, 5, 2), dtype=np.float32)}
+    prefix = {"eef": np.arange(10, dtype=np.float32).reshape(1, 5, 2)}
+    options = {"rtc_mode": mode}
+    if mode == "native":
+        options.update(action_prefix=prefix, rtc_frozen_steps=hard_steps)
+    elif mode == "trained_prefix":
+        options.update(action_prefix=prefix, rtc_prefix_steps=hard_steps)
+
+    restored = _restore_physical_hard_prefix(action, options)
+
+    assert restored == hard_steps
+    np.testing.assert_array_equal(action["eef"][:, :hard_steps], prefix["eef"][:, :hard_steps])
+    np.testing.assert_array_equal(action["eef"][:, hard_steps:], 0.0)
+
+
 class TestGr00tPolicyInit:
     def test_policy_has_model_and_processor(self, policy):
         assert policy.model is not None
@@ -168,6 +191,62 @@ class TestGr00tPolicyGetAction:
         action, info = policy.get_action(obs)
         assert isinstance(action, dict)
         assert isinstance(info, dict)
+
+    def test_native_prefix_is_normalized_without_clipping(self, policy):
+        state_action_processor = policy.processor.state_action_processor
+        state_action_processor.norm_params = {
+            EMBODIMENT: {
+                "action": {key: {"dim": np.asarray(1)} for key in ACTION_KEYS},
+            }
+        }
+        state_action_processor.apply_action.side_effect = (
+            lambda action, embodiment_tag, state, clip_outliers: action
+        )
+        prefix = {
+            key: np.full((1, 3, 1), index, dtype=np.float32)
+            for index, key in enumerate(ACTION_KEYS)
+        }
+
+        packed, model_options, info = policy._prepare_rtc_request(
+            {
+                "rtc_mode": "native",
+                "action_prefix": prefix,
+                "rtc_overlap_steps": 3,
+                "rtc_frozen_steps": 2,
+                "rtc_ramp_rate": 6.0,
+            },
+            [{key: np.zeros((1, 1), dtype=np.float32) for key in STATE_KEYS}],
+        )
+
+        assert packed is not None
+        assert packed.shape == (1, 16, 128)
+        assert torch.count_nonzero(packed[:, :-3]) == 0
+        assert model_options["action_horizon"] == 16
+        assert info == {"rtc_mode": "native", "prefix_steps": 3}
+        assert state_action_processor.apply_action.call_args.kwargs["clip_outliers"] is False
+
+    def test_trained_prefix_checks_checkpoint_bound(self, policy):
+        state_action_processor = policy.processor.state_action_processor
+        state_action_processor.norm_params = {
+            EMBODIMENT: {
+                "action": {key: {"dim": np.asarray(1)} for key in ACTION_KEYS},
+            }
+        }
+        state_action_processor.apply_action.side_effect = (
+            lambda action, embodiment_tag, state, clip_outliers: action
+        )
+        policy.model.config = MagicMock(rtc_training_max_prefix_steps=2)
+        prefix = {key: np.zeros((1, 3, 1), dtype=np.float32) for key in ACTION_KEYS}
+
+        with pytest.raises(ValueError, match="maximum is 2"):
+            policy._prepare_rtc_request(
+                {
+                    "rtc_mode": "trained_prefix",
+                    "action_prefix": prefix,
+                    "rtc_prefix_steps": 3,
+                },
+                [{key: np.zeros((1, 1), dtype=np.float32) for key in STATE_KEYS}],
+            )
 
 
 class _NumpyLanguageSimPolicy:

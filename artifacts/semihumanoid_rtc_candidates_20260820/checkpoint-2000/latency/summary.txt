@@ -1,0 +1,5 @@
+Industrial Next RTC benchmark
+checkpoint: /mnt/data/ml_data/outputs/gr00t/semihumanoid_20260819_230043/checkpoint-2000
+off: total p50=66.90 ms p95=384.89 ms p99=405.20 ms max=423.83 ms p99_steps=21
+native: total p50=157.08 ms p95=378.49 ms p99=386.04 ms max=390.86 ms p99_steps=20
+trained_prefix: total p50=77.81 ms p95=383.71 ms p99=423.34 ms max=437.72 ms p99_steps=22

@@ -80,6 +80,12 @@ if __name__ == "__main__":
     config.model.tune_projector = ft_config.tune_projector
     config.model.tune_diffusion_model = ft_config.tune_diffusion_model
     config.model.state_dropout_prob = ft_config.state_dropout_prob
+    if ft_config.rtc_training_max_prefix_steps >= config.model.action_horizon:
+        raise ValueError(
+            "rtc_training_max_prefix_steps must be smaller than the model action horizon "
+            f"({config.model.action_horizon})"
+        )
+    config.model.rtc_training_max_prefix_steps = ft_config.rtc_training_max_prefix_steps
     config.model.random_rotation_angle = ft_config.random_rotation_angle
     config.model.color_jitter_params = ft_config.color_jitter_params
     config.model.use_percentiles = ft_config.use_percentiles

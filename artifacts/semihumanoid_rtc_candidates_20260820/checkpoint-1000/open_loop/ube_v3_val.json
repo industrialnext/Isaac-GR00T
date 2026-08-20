@@ -1,0 +1,60 @@
+{
+  "average_mae": 0.007677955087274313,
+  "average_mse": 0.00016259949431211376,
+  "config": {
+    "dataset_path": "/home/yskim/ml_data/data/training_data/gr00t/semihumanoid_ube_rtc_cutoff_20260819_033143/ube_v3_val",
+    "denoising_steps": 4,
+    "embodiment_tag": "new_embodiment",
+    "execution_horizon": 16,
+    "modality_keys": null,
+    "steps": 100,
+    "trajectory_ids": [
+      0,
+      1,
+      2
+    ]
+  },
+  "global_step": 1000,
+  "model_path": "/home/yskim/ml_data/outputs/gr00t/semihumanoid_20260819_230043/checkpoint-1000",
+  "provenance": {
+    "checkpoint_action_horizon": 40,
+    "checkpoint_config_sha256": "ca2c610c837aeaa42ece34b4d34c0ad6465bc8e7817c7f398f3d3a735286428e",
+    "checkpoint_model_type": "Gr00tN1d7",
+    "checkpoint_rtc_training_max_prefix_steps": 12,
+    "groot_revision": "709a031151f58a904a7083d3957140822632d371",
+    "industrialnext_rpc_revision": "c3dc583ee36310581ad1ec154559698051988b9f",
+    "model_index_sha256": "407804ea5a62f4f8823f48811ae0edbb82fac101e9cf4d7273e6e2f692bb4d59",
+    "model_path": "/mnt/data/ml_data/outputs/gr00t/semihumanoid_20260819_230043/checkpoint-1000",
+    "model_shards": [
+      {
+        "name": "model-00001-of-00002.safetensors",
+        "sha256": "d102468e718f6a4dc80c99d597a44d600dd619007ac63db82b3f7e1ff5d9de4c",
+        "size_bytes": 4990519232
+      },
+      {
+        "name": "model-00002-of-00002.safetensors",
+        "sha256": "dfa8f48376a022dcb976ceca41e7cc683705581dc0738a35adb1282be09db18d",
+        "size_bytes": 1919980184
+      }
+    ],
+    "processor_config_sha256": "6ca23beee713034452d850b3096b6981eb209211e19656102b96bfd49865cb42"
+  },
+  "schema_version": 1,
+  "trajectories": {
+    "0": {
+      "mae": 0.009389270097017288,
+      "mse": 0.00021600422041956335,
+      "status": "ok"
+    },
+    "1": {
+      "mae": 0.005018098745495081,
+      "mse": 6.414014933397993e-05,
+      "status": "ok"
+    },
+    "2": {
+      "mae": 0.00862649641931057,
+      "mse": 0.00020765411318279803,
+      "status": "ok"
+    }
+  }
+}
