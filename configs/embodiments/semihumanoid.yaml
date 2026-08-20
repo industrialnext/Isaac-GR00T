@@ -1,17 +1,24 @@
 name: semihumanoid
 
 source:
-  # Frozen GPU-machine inventory cutoff: 2026-08-19T03:31:43.248813196Z.
-  # Two stat inventories matched (1,339 files), with no open HDF5 files.
-  # Inventory digest: 3e909412cea6681e1aa9ae613e085c8dbaa8ac9791afd4e1feeec71e0292c92b.
+  # Frozen local inventory cutoff: 2026-08-20T18:25:53Z.
+  # Two stat inventories matched (2,352 episode.h5 files), with no open source HDF5 files.
+  # Inventory digest: 822ba5c16ca2bea87bccb6e80c6fb8cf2fab058fc76e117d2dbb5caeb2e3645b.
   root: ~/ml_data/data/training_data/semihumanoid
-  subsets: ["flexiv_ube_v1", "flexiv_ube_v2", "flexiv_ube_v3", "flexiv_ube_v4"]
+  subsets:
+    - flexiv_matcha_v2
+    - flexiv_matcha_v3
+    - flexiv_matcha_v4
+    - flexiv_ube_v1
+    - flexiv_ube_v2
+    - flexiv_ube_v3
+    - flexiv_ube_v4
   episode_glob: "*/20*/*/*/*/episode.h5"
   exclude_path_contains: ["_failed_recordings"]
   fps: 50
 
 output:
-  root: ~/ml_data/data/training_data/gr00t/semihumanoid_ube_rtc_cutoff_20260819_033143
+  root: ~/ml_data/data/training_data/gr00t/semihumanoid_all_20260820
   robot_type: semihumanoid_bimanual
   strip_subset_prefix: "flexiv_"
   val_every: 20
