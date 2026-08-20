@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-19
 
-**Status:** Reviewed; GPU-machine work complete, deployment-machine validation pending
+**Status:** GPU-machine work complete; deployment loopback attempted and ROS shadow blocked
 
 **Primary repository:** this Isaac-GR00T checkout on the GPU machine
 
@@ -775,10 +775,10 @@ GPU evidence makes `native` the initial shadow frontrunner; this is not a motion
 selection. The deployment machine must still reproduce and compare all modes against the
 same no-motion observation stream.
 
-- [ ] Inspect the deployment checkout, related worktrees, active services, and effective
+- [x] Inspect the deployment checkout, related worktrees, active services, and effective
   configuration before changing anything. Verify the handoff inventory, source revision,
   checkpoint hash, task catalog, and processor artifacts locally.
-- [ ] Run the checkpoint-backed loopback smoke on the deployment machine in `off`, `native`,
+- [x] Run the checkpoint-backed loopback smoke on the deployment machine in `off`, `native`,
   and `trained_prefix` modes. Unsupported old-checkpoint/mode combinations must fail closed.
 - [ ] Coordinate a service window, then run the real ROS policy client only with
   `inference_mode=true`. Confirm from effective runtime parameters and observed topics that
@@ -793,6 +793,37 @@ same no-motion observation stream.
   only if it preserves held-out action accuracy and materially improves continuity without
   increasing holds or rejections. Otherwise select `native` if it passes, or stop with no
   motion if neither does.
+
+**Deployment inspection and loopback evidence (2026-08-19 PDT / 2026-08-20 UTC):** the
+handoff bundle and all seven selected-checkpoint files passed their supplied SHA-256
+inventories. Strict checkpoint load also verified the saved processor and modality contract.
+The deployment host is a single RTX 4090 machine with an active RViz process sharing the GPU.
+The ROS checkout is on `feat/ube-matcha-test` with pre-existing task-config and vendor-library
+changes; the AI checkout is clean on `main`; both Isaac-GR00T and industrialnext_ai resolve
+`industrialnext_rpc` revision `c3dc583e`.
+
+The isolated 60-step loopback produced 51 finite actions in `off`, 35 in `native`, and 55 in
+`trained_prefix`, with zero transport errors and zero non-finite actions in every mode. `off`
+and `trained_prefix` had no inference rejection. `native` observed a 13-step delay; the next
+conservative requirement was 15 steps, beyond the checkpoint/runtime maximum of 12, so the
+server rejected further refreshes and required re-registration after the prior timeline
+drained. A separate 100-call local latency run measured total p99 of 152.79 ms (`off`),
+188.11 ms (`native`), and 183.02 ms (`trained_prefix`), substantially slower and more variable
+than the GPU-machine handoff evidence. The old checkpoint accepted `off`/`native` configuration
+and rejected `trained_prefix` because it does not advertise training-time prefix support.
+
+The review also repaired a fail-closed defect exposed by this run: delay prediction no longer
+silently clamps an out-of-range requirement to the configured maximum. The server now reports
+the true required prefix, refuses the refresh, retains remaining timeline rows, and requires
+re-registration if continuity subsequently drains. Focused regression coverage was added.
+
+The live ROS node reports `inference_mode=false`, `action_delta_clamp_enabled=false`, and
+`require_robot_state_trust=false`; its arm and gripper command publishers have active
+orchestrator subscribers. Because the robot is in active data collection, no configuration,
+service, session, policy action, or command topic was changed. The real-ROS shadow and all
+motion work remain blocked until a coordinated window sets and independently verifies
+`inference_mode=true`. Before that window, GPU contention must also be removed or bounded and
+all three loopbacks must be repeated with zero delay-range failures.
 
 **Gate:** the deployment operator signs the no-motion report and records the exact effective
 runtime configuration. This does not authorize command publication.

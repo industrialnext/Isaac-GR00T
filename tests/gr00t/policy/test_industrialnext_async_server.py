@@ -533,6 +533,45 @@ def test_rtc_missing_contiguous_prefix_does_not_launch_inference() -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("rtc_mode", ["native", "trained_prefix"])
+def test_rtc_delay_prediction_above_runtime_bound_fails_closed(rtc_mode: str) -> None:
+    async def scenario() -> None:
+        policy = _FakePolicy(initially_released=True)
+        server = _server(
+            policy,
+            rtc_mode=rtc_mode,
+            rtc_initial_frozen_steps=1,
+            rtc_delay_margin_steps=1,
+            rtc_max_prefix_steps=4,
+            rtc_native_overlap_steps=4,
+            rtc_min_new_tail_steps=16,
+        )
+        try:
+            session_id = _register(server)
+            _step(server, session_id, include_images=True)
+            await _wait_until(lambda: server._inference_future is None)
+            assert server._active_session is not None
+            server._active_session.observed_delays = [4]
+
+            response = _step(server, session_id)
+
+            assert response["inference_status"] == "prefix_out_of_range"
+            assert response["monitoring"]["rtc_predicted_delay_steps"] == 5
+            assert "required prefix 5" in response["monitoring"]["latest_inference_error"]
+            assert policy.call_count == 1
+            assert server._active_session.timeline
+            assert server._active_session.requires_reregistration is False
+
+            server._active_session.timeline.clear()
+            exhausted = _step(server, session_id)
+            assert exhausted["monitoring"]["requires_reregistration"] is True
+            assert exhausted["monitoring"]["null_reason"] == "reregistration_required"
+        finally:
+            await server.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_rtc_prefix_mismatch_is_rejected_atomically() -> None:
     async def scenario() -> None:
         policy = _FakePolicy(initially_released=True)

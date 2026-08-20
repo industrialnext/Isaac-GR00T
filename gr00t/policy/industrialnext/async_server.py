@@ -625,11 +625,7 @@ class IndustrialNextAsyncServer:
         session.stats.expired_rows += len(expired_targets)
 
         action = session.timeline.pop(candidate_timestep, None)
-        if action is None:
-            null_reason = self._null_reason(session, admission)
-            session.latest_null_reason = null_reason
-            session.stats.record_null(null_reason)
-        else:
+        if action is not None:
             session.served_history[candidate_timestep] = action
             oldest_history = candidate_timestep - ACTION_HORIZON + 1
             session.served_history = {
@@ -649,6 +645,11 @@ class IndustrialNextAsyncServer:
                 self._pending_snapshot = admission.snapshot
         elif self._inference_future is None and not session.timeline:
             session.inference_status = "waiting_for_images"
+
+        if action is None:
+            null_reason = self._null_reason(session, admission)
+            session.latest_null_reason = null_reason
+            session.stats.record_null(null_reason)
 
         server_step_ms = (time.perf_counter() - step_started_at) * 1000.0
         response = self._step_success_response(
@@ -684,12 +685,9 @@ class IndustrialNextAsyncServer:
             if session.observed_delays
             else self.config.rtc_initial_frozen_steps
         )
-        return min(
-            self.config.rtc_max_prefix_steps,
-            max(
-                self.config.rtc_initial_frozen_steps,
-                observed_max + self.config.rtc_delay_margin_steps,
-            ),
+        return max(
+            self.config.rtc_initial_frozen_steps,
+            observed_max + self.config.rtc_delay_margin_steps,
         )
 
     def _build_inference_request(
@@ -703,12 +701,23 @@ class IndustrialNextAsyncServer:
         predicted = self._predict_frozen_steps(session)
         session.latest_available_prefix_steps = available
         session.latest_predicted_delay_steps = predicted
+        if predicted > self.config.rtc_max_prefix_steps:
+            session.inference_status = "prefix_out_of_range"
+            session.latest_inference_error = (
+                f"required prefix {predicted} exceeds runtime maximum "
+                f"{self.config.rtc_max_prefix_steps}"
+            )
+            if not session.timeline:
+                session.requires_reregistration = True
+            return None
         if available < predicted:
             session.inference_status = "missing_prefix"
             session.latest_inference_error = (
                 f"missing_contiguous_prefix: {available} < predicted {predicted}"
             )
             session.stats.missing_prefixes += 1
+            if not session.timeline:
+                session.requires_reregistration = True
             return None
 
         if self.config.rtc_mode == "native":
@@ -732,13 +741,6 @@ class IndustrialNextAsyncServer:
                 overlap_steps=overlap,
             )
 
-        if predicted > self.config.rtc_max_prefix_steps:
-            session.inference_status = "prefix_out_of_range"
-            session.latest_inference_error = (
-                f"predicted prefix {predicted} exceeds trained maximum "
-                f"{self.config.rtc_max_prefix_steps}"
-            )
-            return None
         return InferenceRequest(
             snapshot=snapshot,
             rtc_mode="trained_prefix",
@@ -770,6 +772,7 @@ class IndustrialNextAsyncServer:
             return
         loop = self._bind_event_loop()
         session.inference_status = "running"
+        session.latest_inference_error = None
         session.latest_rtc_mode = request.rtc_mode
         session.latest_overlap_steps = request.overlap_steps
         session.latest_new_tail_steps = ACTION_HORIZON - request.overlap_steps
