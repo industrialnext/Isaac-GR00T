@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import threading
 import time
 from typing import Any
@@ -17,6 +18,7 @@ from gr00t.policy.industrialnext.async_server import (
     IndustrialNextAsyncServer,
     IndustrialNextServingConfig,
 )
+from gr00t.policy.industrialnext.profile_config import load_industrialnext_profile
 from gr00t.policy.industrialnext.task_catalog import TaskCatalog, TaskCatalogEntry
 import numpy as np
 import pytest
@@ -25,6 +27,7 @@ import pytest
 TASK_UUID = "generic_pick"
 TASK_TEXT = "Pick the grounded target object."
 IDENTITY_ROT6D = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+PROFILE = load_industrialnext_profile("configs/embodiments/semihumanoid.yaml")
 
 
 class _FakePolicy:
@@ -79,7 +82,6 @@ def _server(
     return IndustrialNextAsyncServer(
         policy=policy,
         executor=ThreadPoolExecutor(max_workers=1, thread_name_prefix="groot-test"),
-        task_catalog=_catalog(),
         config=IndustrialNextServingConfig(
             max_image_staleness_steps=max_staleness_steps,
             min_usable_action_steps=min_usable_action_steps,
@@ -89,6 +91,7 @@ def _server(
         ),
         service_provenance={"model_path": "/test/model"},
         embodiment_tag="new_embodiment",
+        profile=replace(PROFILE, task_catalog=_catalog()),
     )
 
 
@@ -208,6 +211,9 @@ def test_metadata_and_configuration_contract() -> None:
         IndustrialNextServingConfig(control_hz=49.0)
     with pytest.raises(ValueError, match=r"\[1, 40\]"):
         IndustrialNextServingConfig(min_usable_action_steps=0)
+    assert IndustrialNextServingConfig(action_horizon=8, rtc_mode="off").action_horizon == 8
+    with pytest.raises(ValueError, match="must leave"):
+        IndustrialNextServingConfig(action_horizon=8, rtc_mode="native")
 
 
 def test_protocol_metadata_cannot_be_overridden_by_provenance() -> None:
@@ -216,10 +222,10 @@ def test_protocol_metadata_cannot_be_overridden_by_provenance() -> None:
         server = IndustrialNextAsyncServer(
             policy=policy,
             executor=ThreadPoolExecutor(max_workers=1, thread_name_prefix="groot-test"),
-            task_catalog=_catalog(),
             config=IndustrialNextServingConfig(stats_log_interval_steps=0),
             service_provenance={"async_serving": False, "model_path": "/test/model"},
             embodiment_tag="new_embodiment",
+            profile=replace(PROFILE, task_catalog=_catalog()),
         )
         try:
             service = server.get_metadata()["service_metadata"]
@@ -614,6 +620,95 @@ def test_action_dynamics_limit_rejects_without_clipping_output() -> None:
             assert server._active_session.inference_status == "action_dynamics_limit"
             assert server._active_session.stats.rejected_dynamics == 1
             assert server._active_session.requires_reregistration is True
+        finally:
+            await server.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_xarm_profile_schedules_model_row_zero_at_observation_offset_one() -> None:
+    class XarmPolicy:
+        def get_action(
+            self, observation: dict[str, Any], options: dict[str, Any] | None = None
+        ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+            del observation, options
+            eef = np.zeros((1, 40, 9), dtype=np.float32)
+            eef[0, :, 0] = np.arange(40)
+            eef[0, :, 3:] = IDENTITY_ROT6D
+            return {
+                "right_eef": eef,
+                "right_hand": np.zeros((1, 40, 6), dtype=np.float32),
+            }, {}
+
+    async def scenario() -> None:
+        profile = load_industrialnext_profile("configs/embodiments/xarm_psyonic_mori_bracket.yaml")
+        server = IndustrialNextAsyncServer(
+            policy=XarmPolicy(),
+            executor=ThreadPoolExecutor(max_workers=1, thread_name_prefix="xarm-offset-test"),
+            config=IndustrialNextServingConfig(
+                action_horizon=profile.action_horizon,
+                stats_log_interval_steps=0,
+                rtc_max_prefix_steps=12,
+                rtc_native_overlap_steps=12,
+            ),
+            service_provenance={"model_path": "/test/xarm"},
+            embodiment_tag="new_embodiment",
+            profile=profile,
+        )
+        task = profile.task_catalog.tasks[0]
+        registration = server.handle_request(
+            {
+                "type": "register_session",
+                "control_hz": 50.0,
+                "task_uuid": task.task_uuid,
+                "task_text": task.task_text,
+            }
+        )
+        ok, encoded = cv2.imencode(".jpg", np.zeros((256, 256, 3), dtype=np.uint8))
+        assert ok
+        metadata = {
+            "format": "jpeg",
+            "quality": 90,
+            "dtype": "uint8",
+            "channels": 3,
+            "height": 256,
+            "width": 256,
+        }
+        observation: dict[str, Any] = {
+            "right_arm_pose_pos": [0.0] * 3,
+            "right_arm_pose_rot": IDENTITY_ROT6D,
+            "right_hand": [0.0] * 6,
+            "task_uuid": task.task_uuid,
+            "task_text": task.task_text,
+            "images_meta": {},
+        }
+        for key in profile.wire_image_to_model:
+            observation[key] = encoded.tobytes()
+            observation["images_meta"][key] = dict(metadata)
+        try:
+            first = server.handle_request(
+                {
+                    "type": "step",
+                    "session_id": registration["session_id"],
+                    "observation": observation,
+                }
+            )
+            assert first["timestep"] == 0 and first["action"] is None
+            await _wait_until(lambda: server._inference_future is None)
+            second = server.handle_request(
+                {
+                    "type": "step",
+                    "session_id": registration["session_id"],
+                    "observation": {
+                        key: value
+                        for key, value in observation.items()
+                        if key not in profile.wire_image_to_model and key != "images_meta"
+                    },
+                }
+            )
+            assert second["timestep"] == 1
+            assert second["action"]["right_arm_pose_pos"][0] == 0.0
+            assert second["monitoring_gripper_values"] == {}
         finally:
             await server.shutdown()
 

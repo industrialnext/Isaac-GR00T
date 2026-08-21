@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import h5py
 import numpy as np
@@ -25,6 +26,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent))
 
 from gr00t.data.state_action.pose import EndEffectorPose  # noqa: E402
+import run_zdata_pipeline as pipeline_cli  # noqa: E402
 import zdata_pipeline.check as check_module  # noqa: E402
 from zdata_pipeline.config import (  # noqa: E402
     derive_layout,
@@ -33,6 +35,7 @@ from zdata_pipeline.config import (  # noqa: E402
     render_modality_module,
     resolve_source_subsets,
 )
+import zdata_pipeline.convert as convert_module  # noqa: E402
 from zdata_pipeline.convert import recover_transactions, sync_config  # noqa: E402
 from zdata_pipeline.source import (  # noqa: E402
     assign_split,
@@ -53,6 +56,114 @@ from zdata_pipeline.target_preprocessing import (  # noqa: E402
 REPO_ROOT = Path(__file__).parents[2]
 SEMIHUMANOID_CONFIG = REPO_ROOT / "configs/embodiments/semihumanoid.yaml"
 XARM_PSYONIC_CONFIG = REPO_ROOT / "configs/embodiments/xarm_psyonic_mori_bracket.yaml"
+
+
+def test_config_only_pipeline_runs_experimental_stage_order(tmp_path: Path, monkeypatch) -> None:
+    config = SimpleNamespace(output=SimpleNamespace(root=tmp_path))
+    order: list[str] = []
+    monkeypatch.setattr(pipeline_cli, "load_config", lambda _: config)
+    monkeypatch.setattr(
+        convert_module, "sync_config", lambda *args, **kwargs: order.append("sync") or 0
+    )
+    monkeypatch.setattr(
+        check_module, "generate_missing_stats", lambda *args, **kwargs: order.append("stats") or 0
+    )
+    monkeypatch.setattr(
+        check_module, "check_outputs", lambda *args, **kwargs: order.append("check") or 0
+    )
+
+    def fake_train(*args, **kwargs):
+        assert kwargs["require_frozen"] is False
+        order.append("train")
+        return 0
+
+    monkeypatch.setattr(check_module, "train", fake_train)
+    assert pipeline_cli.main(["--config", "experiment.yaml"]) == 0
+    assert order == ["sync", "stats", "check", "train"]
+
+
+def test_config_only_dry_run_stops_after_sync(tmp_path: Path, monkeypatch) -> None:
+    config = SimpleNamespace(output=SimpleNamespace(root=tmp_path))
+    order: list[str] = []
+    monkeypatch.setattr(pipeline_cli, "load_config", lambda _: config)
+    monkeypatch.setattr(
+        convert_module, "sync_config", lambda *args, **kwargs: order.append("sync") or 0
+    )
+    monkeypatch.setattr(
+        check_module,
+        "generate_missing_stats",
+        lambda *args, **kwargs: pytest.fail("dry-run must stop after sync"),
+    )
+    assert pipeline_cli.main(["--config", "experiment.yaml", "--dry-run"]) == 0
+    assert order == ["sync"]
+
+
+def test_config_only_freeze_reuses_existing_marker_and_trains_frozen(
+    tmp_path: Path, monkeypatch
+) -> None:
+    marker = tmp_path / "_frozen_corpus_manifest.json"
+    marker.write_text("{}\n", encoding="utf-8")
+    config = SimpleNamespace(output=SimpleNamespace(root=tmp_path))
+    order: list[str] = []
+    monkeypatch.setattr(pipeline_cli, "load_config", lambda _: config)
+    monkeypatch.setattr(
+        convert_module,
+        "sync_config",
+        lambda *args, **kwargs: pytest.fail("sync must not mutate an existing frozen corpus"),
+    )
+    monkeypatch.setattr(
+        check_module, "generate_missing_stats", lambda *args, **kwargs: order.append("stats") or 0
+    )
+    monkeypatch.setattr(
+        check_module, "check_outputs", lambda *args, **kwargs: order.append("check") or 0
+    )
+    monkeypatch.setattr(
+        check_module, "freeze_corpus", lambda *args, **kwargs: order.append("freeze") or 0
+    )
+
+    def fake_train(*args, **kwargs):
+        assert kwargs["require_frozen"] is True
+        order.append("train")
+        return 0
+
+    monkeypatch.setattr(check_module, "train", fake_train)
+    assert pipeline_cli.main(["--config", "experiment.yaml", "--freeze"]) == 0
+    assert order == ["stats", "check", "freeze", "train"]
+
+
+def test_direct_unfrozen_train_removes_stale_freeze_marker(tmp_path: Path, monkeypatch) -> None:
+    marker = tmp_path / "_frozen_corpus_manifest.json"
+    marker.write_text("{}\n", encoding="utf-8")
+    config = SimpleNamespace(output=SimpleNamespace(root=tmp_path))
+    monkeypatch.setattr(pipeline_cli, "load_config", lambda _: config)
+
+    def fake_train(*args, **kwargs):
+        assert kwargs["require_frozen"] is False
+        assert not marker.exists()
+        return 0
+
+    monkeypatch.setattr(check_module, "train", fake_train)
+    assert pipeline_cli.main(["train", "--config", "experiment.yaml"]) == 0
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--config", "experiment.yaml", "--freeze", "train"],
+        ["train", "--config", "experiment.yaml", "--freeze"],
+    ],
+)
+def test_train_freeze_flag_works_before_or_after_subcommand(argv: list[str]) -> None:
+    args = pipeline_cli._parser().parse_args(argv)
+    assert args.freeze is True
+
+
+def test_global_subcommand_overrides_are_not_replaced_by_subparser_defaults() -> None:
+    args = pipeline_cli._parser().parse_args(
+        ["--config", "experiment.yaml", "--workers", "8", "--jobs", "3", "sync"]
+    )
+    assert args.workers == 8
+    assert args.jobs == 3
 
 
 def _minimal_yaml(root: Path, output: Path, *, state_extra: str = "", root_extra: str = "") -> str:
@@ -1364,6 +1475,28 @@ def test_training_manifest_binds_converted_content_and_source_stats(tmp_path: Pa
     bound_artifact.write_bytes(bound_artifact.read_bytes() + b"mutation")
     with pytest.raises(RuntimeError, match="verification failed"):
         check_module.verify_training_manifest(manifest_path)
+
+
+def test_experimental_manifest_lists_every_training_dataset(tmp_path: Path, monkeypatch):
+    config, output_root = _synced_test_output(
+        tmp_path, monkeypatch, subsets=2, episodes_per_subset=1
+    )
+    datasets, _ = check_module.find_datasets(output_root)
+    output_directory = tmp_path / "training" / "experimental"
+    manifest_path = check_module.create_experimental_training_manifest(
+        config,
+        datasets,
+        ["train", "--dataset-path", os.pathsep.join(map(str, datasets))],
+        output_directory,
+        steps=3,
+        starts=22,
+        batch=2,
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["mode"] == "experimental_unfrozen"
+    assert manifest["datasets"] == [str(path.resolve()) for path in datasets]
+    assert len(manifest["datasets"]) == 2
+    assert "sha256" not in json.dumps(manifest)
 
 
 def test_freeze_manifest_blocks_pipeline_writes(tmp_path: Path, monkeypatch):

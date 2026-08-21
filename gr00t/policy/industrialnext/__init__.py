@@ -19,7 +19,13 @@ from .adapter import (
     snapshot_is_fresh,
 )
 from .async_server import IndustrialNextAsyncServer, IndustrialNextServingConfig
-from .task_catalog import TaskCatalog, TaskCatalogEntry, load_task_catalog
+from .profile_config import ConfigDrivenIndustrialNextProfile, load_industrialnext_profile
+from .task_catalog import (
+    TaskCatalog,
+    TaskCatalogEntry,
+    load_task_catalog,
+    task_catalog_from_mapping,
+)
 
 
 __all__ = [
@@ -28,6 +34,7 @@ __all__ = [
     "IMAGE_WIDTH",
     "IndustrialNextAsyncServer",
     "IndustrialNextServingConfig",
+    "ConfigDrivenIndustrialNextProfile",
     "CachedImage",
     "ObservationAdmission",
     "ObservationSnapshot",
@@ -38,7 +45,9 @@ __all__ = [
     "build_model_observation",
     "build_synthetic_model_observation",
     "load_task_catalog",
+    "load_industrialnext_profile",
     "map_action_chunk",
     "map_wire_action_prefix",
     "snapshot_is_fresh",
+    "task_catalog_from_mapping",
 ]

@@ -449,6 +449,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         "warn",
         "continuity",
         "train",
+        "serving",
     }
     _warn_unknown(data, root_allowed, str(config_path))
 

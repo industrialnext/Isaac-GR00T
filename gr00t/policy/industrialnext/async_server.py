@@ -17,21 +17,8 @@ import uuid
 from industrialnext_rpc.direct.metadata import Metadata
 import numpy as np
 
-from .adapter import (
-    ACTION_HORIZON,
-    IMAGE_HEIGHT,
-    IMAGE_KEY_TO_MODEL_KEY,
-    IMAGE_WIDTH,
-    CachedImage,
-    ObservationAdmission,
-    ObservationSnapshot,
-    admit_observation,
-    build_model_observation,
-    map_action_chunk,
-    map_wire_action_prefix,
-    snapshot_is_fresh,
-)
-from .task_catalog import TaskCatalog
+from .adapter import CachedImage, ObservationAdmission, ObservationSnapshot, snapshot_is_fresh
+from .profile_config import ConfigDrivenIndustrialNextProfile
 
 
 logger = logging.getLogger(__name__)
@@ -62,73 +49,64 @@ def _prefix_errors(
     expected: tuple[dict[str, list[float]], ...],
     actual: tuple[dict[str, list[float]], ...],
     count: int,
+    profile: ConfigDrivenIndustrialNextProfile,
 ) -> tuple[float, float, float]:
     position_error = 0.0
     orientation_error = 0.0
     gripper_error = 0.0
     for expected_row, actual_row in zip(expected[:count], actual[:count]):
-        for side in ("left", "right"):
-            position_error = max(
-                position_error,
-                float(
-                    np.linalg.norm(
-                        np.asarray(actual_row[f"{side}_arm_pose_pos"])
-                        - np.asarray(expected_row[f"{side}_arm_pose_pos"])
-                    )
-                ),
-            )
+        for field_name in profile.position_action_fields:
+            left = np.asarray(actual_row[field_name], dtype=np.float64)
+            right = np.asarray(expected_row[field_name], dtype=np.float64)
+            position_error = max(position_error, float(np.linalg.norm(left - right)))
+        for field_name in profile.rotation_action_fields:
             orientation_error = max(
                 orientation_error,
-                _rotation_error_rad(
-                    actual_row[f"{side}_arm_pose_rot"],
-                    expected_row[f"{side}_arm_pose_rot"],
-                ),
+                _rotation_error_rad(actual_row[field_name], expected_row[field_name]),
             )
-            gripper_error = max(
-                gripper_error,
-                abs(
-                    float(actual_row[f"{side}_gripper"][0])
-                    - float(expected_row[f"{side}_gripper"][0])
-                ),
-            )
+        for field_name in profile.auxiliary_action_fields:
+            left = np.asarray(actual_row[field_name], dtype=np.float64)
+            right = np.asarray(expected_row[field_name], dtype=np.float64)
+            gripper_error = max(gripper_error, float(np.max(np.abs(left - right))))
     return position_error, orientation_error, gripper_error
 
 
 def _trajectory_dynamics(
     rows: tuple[dict[str, list[float]], ...],
+    profile: ConfigDrivenIndustrialNextProfile,
 ) -> tuple[float, float, float, float, float]:
     max_position_step = 0.0
     max_orientation_step = 0.0
     max_gripper_step = 0.0
     max_position_second_difference = 0.0
     max_gripper_second_difference = 0.0
-    for side in ("left", "right"):
-        positions = np.asarray([row[f"{side}_arm_pose_pos"] for row in rows], dtype=np.float64)
-        grippers = np.asarray([row[f"{side}_gripper"][0] for row in rows], dtype=np.float64)
+    for field_name in profile.position_action_fields:
+        values = np.asarray([row[field_name] for row in rows], dtype=np.float64)
         if len(rows) >= 2:
             max_position_step = max(
-                max_position_step,
-                float(np.linalg.norm(np.diff(positions, axis=0), axis=1).max()),
-            )
-            max_gripper_step = max(max_gripper_step, float(np.abs(np.diff(grippers)).max()))
-            max_orientation_step = max(
-                max_orientation_step,
-                max(
-                    _rotation_error_rad(
-                        rows[index][f"{side}_arm_pose_rot"],
-                        rows[index - 1][f"{side}_arm_pose_rot"],
-                    )
-                    for index in range(1, len(rows))
-                ),
+                max_position_step, float(np.linalg.norm(np.diff(values, axis=0), axis=1).max())
             )
         if len(rows) >= 3:
             max_position_second_difference = max(
                 max_position_second_difference,
-                float(np.linalg.norm(np.diff(positions, n=2, axis=0), axis=1).max()),
+                float(np.linalg.norm(np.diff(values, n=2, axis=0), axis=1).max()),
             )
+    for field_name in profile.rotation_action_fields:
+        if len(rows) >= 2:
+            max_orientation_step = max(
+                max_orientation_step,
+                max(
+                    _rotation_error_rad(rows[index][field_name], rows[index - 1][field_name])
+                    for index in range(1, len(rows))
+                ),
+            )
+    for field_name in profile.auxiliary_action_fields:
+        values = np.asarray([row[field_name] for row in rows], dtype=np.float64)
+        if len(rows) >= 2:
+            max_gripper_step = max(max_gripper_step, float(np.abs(np.diff(values, axis=0)).max()))
+        if len(rows) >= 3:
             max_gripper_second_difference = max(
-                max_gripper_second_difference,
-                float(np.abs(np.diff(grippers, n=2)).max()),
+                max_gripper_second_difference, float(np.abs(np.diff(values, n=2, axis=0)).max())
             )
     return (
         max_position_step,
@@ -150,6 +128,7 @@ class IndustrialNextServingConfig:
     """Runtime settings for the single-session GR00T server."""
 
     control_hz: float = 50.0
+    action_horizon: int = 40
     max_image_staleness_steps: int = 5
     min_usable_action_steps: int = 1
     idle_session_timeout_s: float = 300.0
@@ -175,6 +154,12 @@ class IndustrialNextServingConfig:
         if not math.isfinite(self.control_hz) or self.control_hz != 50.0:
             raise ValueError("control_hz must be exactly 50.0")
         if (
+            isinstance(self.action_horizon, bool)
+            or not isinstance(self.action_horizon, int)
+            or self.action_horizon <= 0
+        ):
+            raise ValueError("action_horizon must be a positive integer")
+        if (
             not isinstance(self.max_image_staleness_steps, int)
             or isinstance(self.max_image_staleness_steps, bool)
             or self.max_image_staleness_steps < 0
@@ -183,9 +168,9 @@ class IndustrialNextServingConfig:
         if (
             not isinstance(self.min_usable_action_steps, int)
             or isinstance(self.min_usable_action_steps, bool)
-            or not 1 <= self.min_usable_action_steps <= ACTION_HORIZON
+            or not 1 <= self.min_usable_action_steps <= self.action_horizon
         ):
-            raise ValueError(f"min_usable_action_steps must be within [1, {ACTION_HORIZON}]")
+            raise ValueError(f"min_usable_action_steps must be within [1, {self.action_horizon}]")
         if not math.isfinite(self.idle_session_timeout_s) or self.idle_session_timeout_s <= 0:
             raise ValueError("idle_session_timeout_s must be finite and positive")
         if (
@@ -209,14 +194,17 @@ class IndustrialNextServingConfig:
                 raise ValueError(f"{name} must be a non-negative integer")
         if self.rtc_delay_window_size < 1:
             raise ValueError("rtc_delay_window_size must be positive")
-        if not 1 <= self.rtc_initial_frozen_steps <= self.rtc_max_prefix_steps:
-            raise ValueError("rtc_initial_frozen_steps must be within [1, rtc_max_prefix_steps]")
-        if self.rtc_max_prefix_steps + self.rtc_min_new_tail_steps > ACTION_HORIZON:
-            raise ValueError("rtc_max_prefix_steps must leave rtc_min_new_tail_steps")
-        if not self.rtc_initial_frozen_steps <= self.rtc_native_overlap_steps:
-            raise ValueError("rtc_native_overlap_steps must cover rtc_initial_frozen_steps")
-        if self.rtc_native_overlap_steps + self.rtc_min_new_tail_steps > ACTION_HORIZON:
-            raise ValueError("rtc_native_overlap_steps must leave rtc_min_new_tail_steps")
+        if self.rtc_mode != "off":
+            if not 1 <= self.rtc_initial_frozen_steps <= self.rtc_max_prefix_steps:
+                raise ValueError(
+                    "rtc_initial_frozen_steps must be within [1, rtc_max_prefix_steps]"
+                )
+            if self.rtc_max_prefix_steps + self.rtc_min_new_tail_steps > self.action_horizon:
+                raise ValueError("rtc_max_prefix_steps must leave rtc_min_new_tail_steps")
+            if not self.rtc_initial_frozen_steps <= self.rtc_native_overlap_steps:
+                raise ValueError("rtc_native_overlap_steps must cover rtc_initial_frozen_steps")
+            if self.rtc_native_overlap_steps + self.rtc_min_new_tail_steps > self.action_horizon:
+                raise ValueError("rtc_native_overlap_steps must leave rtc_min_new_tail_steps")
         finite_positive_fields = {
             "rtc_ramp_rate": self.rtc_ramp_rate,
             "rtc_position_tolerance": self.rtc_position_tolerance,
@@ -276,11 +264,11 @@ class SessionStats:
     def record_null(self, reason: str) -> None:
         self.null_reasons[reason] = self.null_reasons.get(reason, 0) + 1
 
-    def record_grippers(self, rows: tuple[dict[str, list[float]], ...]) -> None:
+    def record_fields(
+        self, rows: tuple[dict[str, list[float]], ...], fields: tuple[str, ...]
+    ) -> None:
         values = [
-            float(row[field_name][0])
-            for row in rows
-            for field_name in ("left_gripper", "right_gripper")
+            float(value) for row in rows for field_name in fields for value in row[field_name]
         ]
         if not values:
             return
@@ -347,18 +335,23 @@ class IndustrialNextAsyncServer:
         *,
         policy: Policy,
         executor: Executor,
-        task_catalog: TaskCatalog,
         config: IndustrialNextServingConfig,
         service_provenance: Mapping[str, Any],
         embodiment_tag: str,
+        profile: ConfigDrivenIndustrialNextProfile,
         owns_executor: bool = True,
     ) -> None:
+        if config.action_horizon != profile.action_horizon:
+            raise ValueError("serving config action_horizon differs from the profile")
+        if config.rtc_mode not in profile.supported_rtc_modes:
+            raise ValueError(f"rtc_mode {config.rtc_mode!r} is not supported by the profile")
         self.policy = policy
         self.executor = executor
-        self.task_catalog = task_catalog
+        self.task_catalog = profile.task_catalog
         self.config = config
         self.service_provenance = dict(service_provenance)
         self.embodiment_tag = embodiment_tag
+        self.profile = profile
         self.owns_executor = owns_executor
         self.server_instance_id = str(uuid.uuid4())
 
@@ -481,11 +474,10 @@ class IndustrialNextAsyncServer:
             "async_serving": True,
             "async_protocol_version": ASYNC_PROTOCOL_VERSION,
             "async_capabilities": list(ASYNC_CAPABILITIES),
-            "expert_camera_height": IMAGE_HEIGHT,
-            "expert_camera_width": IMAGE_WIDTH,
+            **self.profile.service_metadata(),
             "effective_gripper_snap_config": {
                 "enabled": False,
-                "gripper_action_fields": ["left_gripper", "right_gripper"],
+                "gripper_action_fields": list(self.profile.gripper_action_keys),
                 "snap_range": None,
                 "signal_range": None,
             },
@@ -499,17 +491,6 @@ class IndustrialNextAsyncServer:
             },
             "server_instance_id": self.server_instance_id,
             "embodiment_tag": self.embodiment_tag,
-            "video_keys": list(IMAGE_KEY_TO_MODEL_KEY.values()),
-            "state_keys": [
-                "left_eef",
-                "left_gripper",
-                "left_ft",
-                "right_eef",
-                "right_gripper",
-                "right_ft",
-            ],
-            "action_keys": ["left_eef", "left_gripper", "right_eef", "right_gripper"],
-            "action_horizon": ACTION_HORIZON,
             "action_semantics": "absolute",
             "action_rotation_representation": "rot6d",
             "max_sessions": 1,
@@ -600,7 +581,7 @@ class IndustrialNextAsyncServer:
         observation = request.get("observation")
         if not isinstance(observation, Mapping):
             raise ValueError("observation must be a mapping")
-        admission = admit_observation(
+        admission = self.profile.admit_observation(
             observation,
             image_cache=session.image_cache,
             timestep=candidate_timestep,
@@ -627,7 +608,7 @@ class IndustrialNextAsyncServer:
         action = session.timeline.pop(candidate_timestep, None)
         if action is not None:
             session.served_history[candidate_timestep] = action
-            oldest_history = candidate_timestep - ACTION_HORIZON + 1
+            oldest_history = candidate_timestep - self.profile.action_horizon + 1
             session.served_history = {
                 target: row
                 for target, row in session.served_history.items()
@@ -670,7 +651,8 @@ class IndustrialNextAsyncServer:
         self, session: ActiveSession, source_timestep: int
     ) -> tuple[dict[str, list[float]], ...]:
         rows: list[dict[str, list[float]]] = []
-        for target in range(source_timestep, source_timestep + ACTION_HORIZON):
+        target_start = source_timestep + self.profile.action_start_offset_steps
+        for target in range(target_start, target_start + self.profile.action_horizon):
             row = session.served_history.get(target)
             if row is None:
                 row = session.timeline.get(target)
@@ -724,7 +706,7 @@ class IndustrialNextAsyncServer:
             overlap = min(
                 available,
                 self.config.rtc_native_overlap_steps,
-                ACTION_HORIZON - self.config.rtc_min_new_tail_steps,
+                self.profile.action_horizon - self.config.rtc_min_new_tail_steps,
             )
             if overlap < predicted:
                 session.inference_status = "missing_prefix"
@@ -775,18 +757,18 @@ class IndustrialNextAsyncServer:
         session.latest_inference_error = None
         session.latest_rtc_mode = request.rtc_mode
         session.latest_overlap_steps = request.overlap_steps
-        session.latest_new_tail_steps = ACTION_HORIZON - request.overlap_steps
+        session.latest_new_tail_steps = self.profile.action_horizon - request.overlap_steps
         future = loop.run_in_executor(self.executor, self._run_inference, request)
         self._inference_future = future
         future.add_done_callback(lambda completed: self._complete_inference(request, completed))
 
     def _run_inference(self, request: InferenceRequest) -> InferenceResult:
         started_at = time.perf_counter()
-        model_observation = build_model_observation(request.snapshot)
+        model_observation = self.profile.build_model_observation(request.snapshot)
         decode_ms = (time.perf_counter() - started_at) * 1000.0
         options: dict[str, Any] = {"rtc_mode": request.rtc_mode}
         if request.rtc_mode != "off":
-            options["action_prefix"] = map_wire_action_prefix(request.prefix_rows)
+            options["action_prefix"] = self.profile.map_wire_action_prefix(request.prefix_rows)
         if request.rtc_mode == "native":
             options.update(
                 {
@@ -798,7 +780,7 @@ class IndustrialNextAsyncServer:
         elif request.rtc_mode == "trained_prefix":
             options["rtc_prefix_steps"] = request.predicted_frozen_steps
         action, policy_info = self.policy.get_action(model_observation, options=options)
-        rows = map_action_chunk(action)
+        rows = self.profile.map_action_chunk(action)
         return InferenceResult(
             request=request,
             rows=rows,
@@ -840,7 +822,8 @@ class IndustrialNextAsyncServer:
 
     def _admit_inference_result(self, session: ActiveSession, result: InferenceResult) -> None:
         request = result.request
-        actual_delay = max(1, session.timestep - request.snapshot.source_timestep + 1)
+        target_start = request.snapshot.source_timestep + self.profile.action_start_offset_steps
+        actual_delay = max(0, session.timestep - target_start + 1)
         session.latest_actual_delay_steps = actual_delay
         session.observed_delays.append(actual_delay)
         session.observed_delays = session.observed_delays[-self.config.rtc_delay_window_size :]
@@ -848,9 +831,9 @@ class IndustrialNextAsyncServer:
         session.image_decode_latency_ms = result.image_decode_latency_ms
         session.total_inferences += 1
         session.latest_source_timestep = request.snapshot.source_timestep
-        session.stats.record_grippers(result.rows)
+        session.stats.record_fields(result.rows, self.profile.gripper_action_keys)
 
-        dynamics = _trajectory_dynamics(result.rows)
+        dynamics = _trajectory_dynamics(result.rows, self.profile)
         (
             session.latest_max_position_step_m,
             session.latest_max_orientation_step_rad,
@@ -858,11 +841,12 @@ class IndustrialNextAsyncServer:
             session.latest_max_position_second_difference_m,
             session.latest_max_gripper_second_difference,
         ) = dynamics
-        if actual_delay < len(result.rows):
+        if 0 < actual_delay < len(result.rows):
             seam = _prefix_errors(
                 (result.rows[actual_delay - 1],),
                 (result.rows[actual_delay],),
                 1,
+                self.profile,
             )
             (
                 session.latest_first_admitted_position_seam_m,
@@ -908,6 +892,7 @@ class IndustrialNextAsyncServer:
                 request.prefix_rows,
                 result.rows,
                 hard_prefix_steps,
+                self.profile,
             )
             session.latest_prefix_position_error = position_error
             session.latest_prefix_orientation_error_rad = orientation_error
@@ -929,9 +914,9 @@ class IndustrialNextAsyncServer:
                 return
 
         future_rows = {
-            request.snapshot.source_timestep + index: row
+            target_start + index: row
             for index, row in enumerate(result.rows)
-            if request.snapshot.source_timestep + index > session.timestep
+            if target_start + index > session.timestep
         }
         if len(future_rows) < self.config.min_usable_action_steps:
             session.stats.rejected_tails += 1
@@ -1068,14 +1053,7 @@ class IndustrialNextAsyncServer:
             "first_admitted_gripper_seam": session.latest_first_admitted_gripper_seam,
             "requires_reregistration": session.requires_reregistration,
         }
-        monitoring_grippers = (
-            {}
-            if action is None
-            else {
-                "left_gripper": list(action["left_gripper"]),
-                "right_gripper": list(action["right_gripper"]),
-            }
-        )
+        monitoring_grippers = self.profile.monitoring_gripper_values(action)
         return {
             "action": action,
             "timestep": session.timestep,

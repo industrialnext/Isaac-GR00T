@@ -101,3 +101,26 @@ train:
   weight_decay: 1.0e-5
   warmup_ratio: 0.05
   rtc_training_max_prefix_steps: 0
+
+serving:
+  profile: xarm_psyonic
+  embodiment_tag: new_embodiment
+  model_path: outputs/gr00t/xarm_psyonic_mori_bracket_20260821_045022/checkpoint-5778
+  device: cuda:0
+  host: 127.0.0.1
+  port: 10012
+  control_hz: 50
+  image_size: [256, 256]
+  rtc_mode: "off"
+  field_lengths:
+    right_arm_pose_pos: 3
+    right_arm_pose_rot: 6
+    right_hand: 6
+  ignored_observation_keys: [static_center_depth, eoat_right_bottom_depth]
+  field_units:
+    right_arm_pose_pos: m
+    right_arm_pose_rot: rot6d_columns
+    right_hand: rad
+  eef_frame: deployment_configured
+  supported_rtc_modes: ["off"]
+  gripper_action_keys: []

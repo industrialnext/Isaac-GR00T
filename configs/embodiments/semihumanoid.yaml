@@ -118,3 +118,36 @@ train:
   weight_decay: 1.0e-5
   warmup_ratio: 0.05
   rtc_training_max_prefix_steps: 12
+
+serving:
+  profile: semihumanoid
+  embodiment_tag: new_embodiment
+  model_path: ~/ml_data/outputs/gr00t/semihumanoid_20260820_202230/checkpoint-6321
+  device: cuda:0
+  host: 127.0.0.1
+  port: 10012
+  control_hz: 50
+  image_size: [256, 256]
+  rtc_mode: "off"
+  field_lengths:
+    left_arm_pose_pos: 3
+    left_arm_pose_rot: 6
+    left_gripper: 1
+    left_ft: 6
+    right_arm_pose_pos: 3
+    right_arm_pose_rot: 6
+    right_gripper: 1
+    right_ft: 6
+  ignored_observation_keys: [head_depth, eoat_left_bottom_depth, eoat_right_bottom_depth]
+  field_units:
+    left_arm_pose_pos: m
+    left_arm_pose_rot: rot6d_columns
+    left_gripper: normalized
+    left_ft: sensor_native
+    right_arm_pose_pos: m
+    right_arm_pose_rot: rot6d_columns
+    right_gripper: normalized
+    right_ft: sensor_native
+  eef_frame: deployment_configured
+  supported_rtc_modes: ["off", native, trained_prefix]
+  gripper_action_keys: [left_gripper, right_gripper]

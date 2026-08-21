@@ -134,6 +134,40 @@ def load_task_catalog(path: str | Path) -> TaskCatalog:
     )
 
 
+def task_catalog_from_mapping(
+    task_family: str,
+    tasks: Mapping[str, str],
+    *,
+    display_names: Mapping[str, str] | None = None,
+) -> TaskCatalog:
+    """Build the same validated catalog directly from an embodiment config."""
+    task_family = _exact_nonempty_string(task_family, "task_family")
+    if not isinstance(tasks, Mapping) or not tasks:
+        raise ValueError("tasks must be a non-empty mapping")
+    if display_names is not None and not isinstance(display_names, Mapping):
+        raise ValueError("display_names must be a mapping")
+    display_names = {} if display_names is None else display_names
+    entries: list[TaskCatalogEntry] = []
+    for task_uuid, task_text in tasks.items():
+        uuid_value = _exact_nonempty_string(task_uuid, "task_uuid")
+        entries.append(
+            TaskCatalogEntry(
+                task_uuid=uuid_value,
+                task_text=_exact_nonempty_string(task_text, f"tasks.{uuid_value}"),
+                display_name=_exact_nonempty_string(
+                    display_names.get(uuid_value, uuid_value.replace("_", " ").title()),
+                    f"display_names.{uuid_value}",
+                ),
+            )
+        )
+    return TaskCatalog(
+        schema_version=_SUPPORTED_SCHEMA_VERSION,
+        task_family=task_family,
+        catalog_version=None,
+        tasks=tuple(entries),
+    )
+
+
 def _exact_nonempty_string(value: Any, field_name: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{field_name} must be a string")

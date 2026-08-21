@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import json
 from pathlib import Path
 import threading
@@ -17,7 +18,7 @@ import cv2
 from gr00t.eval.run_gr00t_industrialnext_server import (
     ServerConfig,
     build_service_provenance,
-    validate_server_config,
+    resolve_server_config,
 )
 from gr00t.policy.industrialnext import (
     ACTION_HORIZON,
@@ -25,6 +26,7 @@ from gr00t.policy.industrialnext import (
     IndustrialNextServingConfig,
     TaskCatalog,
     TaskCatalogEntry,
+    load_industrialnext_profile,
 )
 from gr00t.policy.industrialnext.adapter import IMAGE_KEY_TO_MODEL_KEY
 from industrialnext_rpc.direct.client import DirectClient
@@ -36,6 +38,7 @@ import pytest
 TASK_UUID = "generic_pick"
 TASK_TEXT = "Pick the grounded target object."
 IDENTITY_ROT6D = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+PROFILE = load_industrialnext_profile("configs/embodiments/semihumanoid.yaml")
 
 
 class _BlockingPolicy:
@@ -63,18 +66,19 @@ class _BlockingPolicy:
 
 
 def _handler(policy: _BlockingPolicy) -> IndustrialNextAsyncServer:
+    task_catalog = TaskCatalog(
+        schema_version=1,
+        task_family="test",
+        catalog_version="test",
+        tasks=(TaskCatalogEntry(TASK_UUID, TASK_TEXT, "Pick"),),
+    )
     return IndustrialNextAsyncServer(
         policy=policy,
         executor=ThreadPoolExecutor(max_workers=1, thread_name_prefix="groot-protocol-test"),
-        task_catalog=TaskCatalog(
-            schema_version=1,
-            task_family="test",
-            catalog_version="test",
-            tasks=(TaskCatalogEntry(TASK_UUID, TASK_TEXT, "Pick"),),
-        ),
         config=IndustrialNextServingConfig(stats_log_interval_steps=0),
         service_provenance={"model_path": "/test/model"},
         embodiment_tag="new_embodiment",
+        profile=replace(PROFILE, task_catalog=task_catalog),
     )
 
 
@@ -249,53 +253,41 @@ def test_real_direct_server_client_loopback_contract() -> None:
     asyncio.run(scenario())
 
 
-def test_cli_safety_gate_and_lightweight_provenance(tmp_path: Path) -> None:
+def test_config_only_cli_defaults_and_overrides(tmp_path: Path) -> None:
     model_path = tmp_path / "model"
-    processor_path = model_path / "processor"
-    processor_path.mkdir(parents=True)
-    (model_path / "model-00001-of-00001.safetensors").write_bytes(b"weights")
-    (model_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {"layer": "model-00001-of-00001.safetensors"}}),
+    model_path.mkdir()
+    config_path = tmp_path / "semihumanoid.yaml"
+    source = Path("configs/embodiments/semihumanoid.yaml").read_text(encoding="utf-8")
+    config_path.write_text(
+        source.replace(
+            "~/ml_data/outputs/gr00t/semihumanoid_20260820_202230/checkpoint-6321",
+            str(model_path),
+        ),
         encoding="utf-8",
     )
-    (processor_path / "processor_config.json").write_text("{}\n", encoding="utf-8")
-    catalog_path = tmp_path / "catalog.yaml"
-    catalog_path.write_text("tasks: []\n", encoding="utf-8")
 
-    safe = ServerConfig(model_path=str(model_path), task_catalog_path=str(catalog_path), port=0)
-    assert validate_server_config(safe) == (model_path.resolve(), catalog_path.resolve())
+    resolved, profile = resolve_server_config(ServerConfig(config=str(config_path), port=0))
+    assert resolved.model_path == model_path.resolve()
+    assert resolved.port == 0
+    assert profile.task_catalog.tasks
     with pytest.raises(ValueError, match="non-loopback host rejected"):
-        validate_server_config(
-            ServerConfig(
-                model_path=str(model_path),
-                task_catalog_path=str(catalog_path),
-                host="0.0.0.0",
-            )
-        )
+        resolve_server_config(ServerConfig(config=str(config_path), host="0.0.0.0"))
     with pytest.raises(ValueError, match="unknown log_level"):
-        validate_server_config(
-            ServerConfig(
-                model_path=str(model_path),
-                task_catalog_path=str(catalog_path),
-                log_level="verbose",
-            )
-        )
+        resolve_server_config(ServerConfig(config=str(config_path), log_level="verbose"))
 
     (model_path / "config.json").write_text(
         json.dumps({"model_type": "Gr00tN1d7", "action_horizon": 40}),
         encoding="utf-8",
     )
     native = ServerConfig(
-        model_path=str(model_path),
-        task_catalog_path=str(catalog_path),
+        config=str(config_path),
         rtc_mode="native",
     )
-    assert validate_server_config(native) == (model_path.resolve(), catalog_path.resolve())
+    assert resolve_server_config(native)[0].serving.rtc_mode == "native"
     with pytest.raises(ValueError, match="does not advertise"):
-        validate_server_config(
+        resolve_server_config(
             ServerConfig(
-                model_path=str(model_path),
-                task_catalog_path=str(catalog_path),
+                config=str(config_path),
                 rtc_mode="trained_prefix",
             )
         )
@@ -310,21 +302,14 @@ def test_cli_safety_gate_and_lightweight_provenance(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     trained = ServerConfig(
-        model_path=str(model_path),
-        task_catalog_path=str(catalog_path),
+        config=str(config_path),
         rtc_mode="trained_prefix",
         rtc_max_prefix_steps=4,
     )
-    assert validate_server_config(trained) == (model_path.resolve(), catalog_path.resolve())
-
-    provenance = build_service_provenance(model_path)
-    assert provenance["model_path"] == str(model_path.resolve())
-    assert provenance["model_shards"] == [
-        {
-            "name": "model-00001-of-00001.safetensors",
-            "size_bytes": 7,
-            "sha256": "9a129038d9a00aed0cf6a7ea059ca50a813449061ab87848cf1a13eafdf33b2c",
-        }
-    ]
-    assert len(provenance["model_index_sha256"]) == 64
-    assert len(provenance["processor_config_sha256"]) == 64
+    assert resolve_server_config(trained)[0].serving.rtc_max_prefix_steps == 4
+    assert build_service_provenance(model_path) == {
+        "model_path": str(model_path.resolve()),
+        "checkpoint_model_type": "Gr00tN1d7",
+        "checkpoint_action_horizon": 40,
+        "checkpoint_rtc_training_max_prefix_steps": 4,
+    }

@@ -13,7 +13,10 @@ import time
 from typing import Any
 
 import cv2
-from gr00t.policy.industrialnext.adapter import IMAGE_KEY_TO_MODEL_KEY
+from gr00t.policy.industrialnext import (
+    ConfigDrivenIndustrialNextProfile,
+    load_industrialnext_profile,
+)
 from industrialnext_rpc.direct.client import DirectClient
 import numpy as np
 import tyro
@@ -24,39 +27,45 @@ IDENTITY_ROT6D = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 
 @dataclass(frozen=True)
 class LoopbackSmokeConfig:
-    output_json_path: str
-    host: str = "127.0.0.1"
-    port: int = 10012
-    task_uuid: str = "generic_pick"
-    task_text: str = "Pick the grounded target object and hold it securely in the gripper."
-    control_hz: float = 50.0
+    config: str
+    output_json_path: str | None = None
+    host: str | None = None
+    port: int | None = None
+    task_uuid: str | None = None
+    task_text: str | None = None
     steps: int = 60
     image_refresh_steps: int = 4
 
     def __post_init__(self) -> None:
-        if not math.isfinite(self.control_hz) or self.control_hz <= 0:
-            raise ValueError("control_hz must be finite and positive")
-        if self.steps <= 0:
+        if isinstance(self.steps, bool) or not isinstance(self.steps, int) or self.steps <= 0:
             raise ValueError("steps must be positive")
-        if self.image_refresh_steps <= 0:
+        if (
+            isinstance(self.image_refresh_steps, bool)
+            or not isinstance(self.image_refresh_steps, int)
+            or self.image_refresh_steps <= 0
+        ):
             raise ValueError("image_refresh_steps must be positive")
 
 
-def _observation(*, include_images: bool, task_uuid: str, task_text: str) -> dict[str, Any]:
+def _observation(
+    profile: ConfigDrivenIndustrialNextProfile,
+    *,
+    include_images: bool,
+    task_uuid: str,
+    task_text: str,
+) -> dict[str, Any]:
     observation: dict[str, Any] = {
-        "left_arm_pose_pos": [0.1, 0.2, 0.3],
-        "left_arm_pose_rot": IDENTITY_ROT6D,
-        "left_gripper": [0.25],
-        "left_ft": [0.0] * 6,
-        "right_arm_pose_pos": [-0.1, -0.2, -0.3],
-        "right_arm_pose_rot": IDENTITY_ROT6D,
-        "right_gripper": [0.75],
-        "right_ft": [0.0] * 6,
         "task_uuid": task_uuid,
         "task_text": task_text,
     }
+    rotation_fields = set(profile.rotation_state_fields)
+    for field in profile.state_fields:
+        width = profile.field_lengths[field]
+        observation[field] = IDENTITY_ROT6D if field in rotation_fields else [0.0] * width
     if include_images:
-        ok, encoded = cv2.imencode(".jpg", np.zeros((256, 256, 3), dtype=np.uint8))
+        ok, encoded = cv2.imencode(
+            ".jpg", np.zeros((profile.image_height, profile.image_width, 3), dtype=np.uint8)
+        )
         if not ok:
             raise RuntimeError("failed to encode synthetic loopback image")
         metadata = {
@@ -64,11 +73,11 @@ def _observation(*, include_images: bool, task_uuid: str, task_text: str) -> dic
             "quality": 90,
             "dtype": "uint8",
             "channels": 3,
-            "height": 256,
-            "width": 256,
+            "height": profile.image_height,
+            "width": profile.image_width,
         }
         observation["images_meta"] = {}
-        for key in IMAGE_KEY_TO_MODEL_KEY:
+        for key in profile.wire_image_to_model:
             observation[key] = encoded.tobytes()
             observation["images_meta"][key] = dict(metadata)
     return observation
@@ -87,11 +96,22 @@ def _all_finite(value: Any) -> bool:
 
 
 def main(config: LoopbackSmokeConfig) -> None:
-    output_path = Path(config.output_json_path).expanduser().resolve()
-    if output_path.exists():
+    profile = load_industrialnext_profile(config.config)
+    task = profile.task_catalog.tasks[0]
+    task_uuid = task.task_uuid if config.task_uuid is None else config.task_uuid
+    task_text = task.task_text if config.task_text is None else config.task_text
+    host = profile.host if config.host is None else config.host
+    port = profile.port if config.port is None else config.port
+    control_hz = profile.control_hz
+    output_path = (
+        Path("/tmp") / f"gr00t_industrialnext_loopback_{profile.profile_name}_{time.time_ns()}.json"
+        if config.output_json_path is None
+        else Path(config.output_json_path).expanduser().resolve()
+    )
+    if config.output_json_path is not None and output_path.exists():
         raise FileExistsError(f"loopback report already exists: {output_path}")
 
-    client = DirectClient(config.host, config.port)
+    client = DirectClient(host, port)
     responses: list[dict[str, Any]] = []
     metadata: dict[str, Any] | None = None
     registration: dict[str, Any] | None = None
@@ -102,11 +122,13 @@ def main(config: LoopbackSmokeConfig) -> None:
         registration = client.request(
             {
                 "type": "register_session",
-                "control_hz": config.control_hz,
-                "task_uuid": config.task_uuid,
-                "task_text": config.task_text,
+                "control_hz": control_hz,
+                "task_uuid": task_uuid,
+                "task_text": task_text,
             }
         )
+        if registration.get("error"):
+            raise RuntimeError(registration["error"])
         session_id = registration["session_id"]
         next_deadline = time.monotonic()
         for step in range(config.steps):
@@ -115,9 +137,10 @@ def main(config: LoopbackSmokeConfig) -> None:
                     "type": "step",
                     "session_id": session_id,
                     "observation": _observation(
+                        profile,
                         include_images=step % config.image_refresh_steps == 0,
-                        task_uuid=config.task_uuid,
-                        task_text=config.task_text,
+                        task_uuid=task_uuid,
+                        task_text=task_text,
                     ),
                 }
             )
@@ -132,7 +155,7 @@ def main(config: LoopbackSmokeConfig) -> None:
                     "monitoring": response.get("monitoring"),
                 }
             )
-            next_deadline += 1.0 / config.control_hz
+            next_deadline += 1.0 / control_hz
             time.sleep(max(0.0, next_deadline - time.monotonic()))
         client.request({"type": "close_session", "session_id": session_id})
     except Exception as exc:
@@ -162,6 +185,7 @@ def main(config: LoopbackSmokeConfig) -> None:
     output_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if failure is not None or errors or nonfinite or action_responses == 0:
         raise RuntimeError(f"loopback smoke failed; see {output_path}")
+    print(f"Industrial Next loopback smoke passed: {output_path}")
 
 
 if __name__ == "__main__":

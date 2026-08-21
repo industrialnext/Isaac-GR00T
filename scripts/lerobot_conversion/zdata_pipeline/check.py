@@ -810,6 +810,43 @@ def create_training_manifest(
     return manifest_path
 
 
+def create_experimental_training_manifest(
+    config: PipelineConfig,
+    datasets: list[Path],
+    command: list[str],
+    output_directory: Path,
+    *,
+    steps: int,
+    starts: int,
+    batch: int,
+) -> Path:
+    """Write the lightweight manifest used by the mutable experimental workflow."""
+    manifest = {
+        "schema_version": 1,
+        "mode": "experimental_unfrozen",
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "pipeline_name": config.name,
+        "pipeline_config": str(config.config_path),
+        "datasets": [str(path.resolve()) for path in datasets],
+        "action_horizon": config.action.horizon,
+        "fps": config.source.fps,
+        "trainable_starts": starts,
+        "max_steps": steps,
+        "global_batch_size": batch,
+        "effective_epochs": steps * batch / starts,
+        "rtc_training_max_prefix_steps": config.train.rtc_training_max_prefix_steps,
+        "base_model": config.train.base_model,
+        "command": command,
+    }
+    output_directory.parent.mkdir(parents=True, exist_ok=True)
+    output_directory.mkdir()
+    manifest_path = output_directory / "run_manifest.json"
+    temporary_path = output_directory / ".run_manifest.json.tmp"
+    temporary_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    temporary_path.replace(manifest_path)
+    return manifest_path
+
+
 def verify_training_manifest(manifest_path: Path) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     for section in ("pipeline_config", "modality_module", "frozen_corpus_manifest"):
@@ -922,6 +959,7 @@ def train(
     *,
     smoke_max_steps: int | None = None,
     smoke_batch: int = 1,
+    require_frozen: bool = False,
 ) -> int:
     if smoke_max_steps is not None:
         if resume_from is not None:
@@ -930,9 +968,13 @@ def train(
             raise ValueError("smoke_max_steps and smoke_batch must be positive")
     assert_no_incomplete_transactions(config.output.root)
     frozen_manifest = frozen_corpus_manifest_path(config.output.root)
-    if not frozen_manifest.is_file():
-        raise FileNotFoundError(f"training requires a frozen corpus: {frozen_manifest}")
-    verify_frozen_corpus(frozen_manifest)
+    if require_frozen:
+        if not frozen_manifest.is_file():
+            raise FileNotFoundError(f"training requires a frozen corpus: {frozen_manifest}")
+        verify_frozen_corpus(frozen_manifest)
+    elif frozen_manifest.exists():
+        frozen_manifest.unlink()
+        print(f"removed freeze marker for mutable experimental training: {frozen_manifest}")
     train_datasets, _ = find_datasets(config.output.root)
     if not train_datasets:
         raise ValueError(f"no train datasets under {config.output.root}")
@@ -967,7 +1009,10 @@ def train(
     print("launch:", " ".join(command))
     _report_resources(config.train.out_base)
     if resume_from is None:
-        manifest_path = create_training_manifest(
+        manifest_writer = (
+            create_training_manifest if require_frozen else create_experimental_training_manifest
+        )
+        manifest_path = manifest_writer(
             config,
             train_datasets,
             command,
@@ -976,12 +1021,14 @@ def train(
             starts=starts,
             batch=effective_batch,
         )
-        print(f"verified training manifest: {manifest_path}")
+        qualifier = "verified content-bound" if require_frozen else "wrote experimental"
+        print(f"{qualifier} training manifest: {manifest_path}")
     else:
         manifest_path = output_directory / "run_manifest.json"
         if not manifest_path.is_file():
             raise FileNotFoundError(f"resume run lacks run_manifest.json: {output_directory}")
-        verify_training_manifest(manifest_path)
+        if require_frozen:
+            verify_training_manifest(manifest_path)
     environment = os.environ.copy()
     environment.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
     return_code = subprocess.run(command, env=environment, check=False).returncode
