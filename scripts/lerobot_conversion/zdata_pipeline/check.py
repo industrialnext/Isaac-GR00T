@@ -452,6 +452,7 @@ def build_train_command(
     gpus_override: int | None = None,
     batch_override: int | None = None,
     max_steps_override: int | None = None,
+    logging_steps_override: int | None = None,
     output_name_suffix: str = "",
 ) -> tuple[list[str], Path, int, int]:
     from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
@@ -556,6 +557,10 @@ def build_train_command(
             command.extend([key, str(value)])
     if config.train.use_wandb:
         command.extend(["--use-wandb", "--wandb-project", config.train.wandb_project])
+    if logging_steps_override is not None:
+        if logging_steps_override <= 0:
+            raise ValueError("logging_steps_override must be positive")
+        command.extend(["--logging-steps", str(logging_steps_override)])
     if resume_from is not None:
         command.append("--resume-from-checkpoint")
     return command, output_directory, int(steps), starts
@@ -950,6 +955,7 @@ def train(
         gpus_override=1 if smoke_max_steps is not None else None,
         batch_override=smoke_batch if smoke_max_steps is not None else None,
         max_steps_override=smoke_max_steps,
+        logging_steps_override=1 if smoke_max_steps is not None else None,
         output_name_suffix="_smoke" if smoke_max_steps is not None else "",
     )
     effective_batch = smoke_batch if smoke_max_steps is not None else config.train.batch

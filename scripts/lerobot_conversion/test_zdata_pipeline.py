@@ -43,10 +43,16 @@ from zdata_pipeline.source import (  # noqa: E402
     rot6d_source_to_groot,
     stage_source,
 )
+import zdata_pipeline.target_preprocessing as target_preprocessing_module  # noqa: E402
+from zdata_pipeline.target_preprocessing import (  # noqa: E402
+    QPSmoothingError,
+    preprocess_action_segment,
+)
 
 
 REPO_ROOT = Path(__file__).parents[2]
 SEMIHUMANOID_CONFIG = REPO_ROOT / "configs/embodiments/semihumanoid.yaml"
+XARM_PSYONIC_CONFIG = REPO_ROOT / "configs/embodiments/xarm_psyonic_mori_bracket.yaml"
 
 
 def _minimal_yaml(root: Path, output: Path, *, state_extra: str = "", root_extra: str = "") -> str:
@@ -128,6 +134,34 @@ def test_generated_semihumanoid_modality_module_imports_in_clean_process():
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_xarm_psyonic_config_derives_expected_layout_and_generated_module():
+    config = load_config(XARM_PSYONIC_CONFIG)
+    widths = {
+        "right_arm_pose_pos": 3,
+        "right_arm_pose_rot": 6,
+        "right_hand": 6,
+    }
+    layout = derive_layout(config, widths, widths, (256, 256, 3))
+
+    assert layout.state_dim == 15
+    assert layout.action_dim == 15
+    assert layout.state_slices == {"right_eef": (0, 9), "right_hand": (9, 15)}
+    assert layout.action_slices == {"right_eef": (0, 9), "right_hand": (9, 15)}
+    assert config.action.source == "observation"
+    assert config.action.observation_offset == 1
+    assert config.action.horizon == 40
+    assert config.cameras == {
+        "front": "static_center_rgb",
+        "wrist": "eoat_right_bottom_rgb",
+    }
+    assert (
+        render_modality_module(config)
+        == (
+            REPO_ROOT / "examples/xarm_psyonic_mori_bracket/xarm_psyonic_mori_bracket_config.py"
+        ).read_text()
+    )
 
 
 def test_output_only_module_does_not_import_optional_h5py():
@@ -457,6 +491,240 @@ def _test_config(tmp_path: Path, *, gap_ms: float | None = None) -> tuple[Path, 
         text += f"\ncontinuity:\n  split_on_gap_ms: {gap_ms}\n"
     config_path.write_text(text)
     return config_path, source_root, output_root
+
+
+def _observation_config_text(root: Path, output: Path, *, preprocessing: bool = False) -> str:
+    text = _minimal_yaml(root, output).replace(
+        "action:\n  source: executed\n",
+        "action:\n  source: observation\n  observation_offset: 1\n",
+    )
+    if preprocessing:
+        text = text.replace(
+            "  horizon: 40\n",
+            """  horizon: 40
+  preprocessing:
+    enabled: true
+    max_deviation_position: 0.002
+    max_deviation_rotation: 0.01
+    rotation_method: so3_tangent_qp
+    skip_fields: []
+    outlier_filter:
+      enabled: true
+      max_repair_intervals: 32
+      position_step_threshold_m: 0.020
+      position_max_repaired_step_m: 0.005
+      rotation_step_threshold_rad: 0.349066
+      rotation_max_repaired_step_rad: 0.087266
+""",
+        )
+    return text
+
+
+def test_observation_config_rejects_invalid_offsets_and_preprocessing(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    base = _observation_config_text(tmp_path, tmp_path / "out", preprocessing=True)
+
+    config_path.write_text(base.replace("observation_offset: 1", "observation_offset: -1"))
+    with pytest.raises(ValueError, match="observation_offset must be non-negative"):
+        load_config(config_path)
+
+    config_path.write_text(base.replace("source: observation", "source: executed"))
+    with pytest.raises(ValueError, match="observation_offset is only valid"):
+        load_config(config_path)
+
+    config_path.write_text(base.replace("skip_fields: []", "skip_fields: [missing]"))
+    with pytest.raises(ValueError, match="unknown action keys"):
+        load_config(config_path)
+
+    config_path.write_text(
+        base.replace("position_max_repaired_step_m: 0.005", "position_max_repaired_step_m: 0.020")
+    )
+    with pytest.raises(ValueError, match="bounds must be smaller"):
+        load_config(config_path)
+
+
+def test_observation_offset_stages_next_state_without_mutating_observations(
+    tmp_path: Path, monkeypatch
+):
+    import zdata_pipeline.source as source_module
+
+    source_root = tmp_path / "sources"
+    output_root = tmp_path / "output"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(_observation_config_text(source_root, output_root))
+    subset = source_root / "source_one"
+    source = subset / "robot/2026/08/18/episode_ok_expert/episode.h5"
+    _write_episode(source, frame_count=50)
+    with h5py.File(source, "r+") as h5:
+        positions = np.arange(50, dtype=np.float32) / 1000.0
+        h5["state/flat"][:, 0] = positions
+        h5["action/executed"][:, 0] = -1.0
+    config = load_config(config_path)
+    description = inspect_source(config, subset, source)
+    monkeypatch.setattr(source_module, "_encode_video", _fake_encode_video)
+    staged = stage_source(config, description, tmp_path / "stage")
+    dataframe = pd.read_parquet(staged.segments[0].parquet)
+    state = np.stack(dataframe["observation.state"])
+    action = np.stack(dataframe["action"])
+
+    assert len(dataframe) == 49
+    assert np.allclose(state[:, 0], np.arange(49) / 1000.0)
+    assert np.allclose(action[:, 0], np.arange(1, 50) / 1000.0)
+    assert bool(dataframe["next.done"].iloc[-1])
+    assert staged.segments[0].source_end == 49
+    assert staged.segments[0].preprocessing["observation_offset"] == 1
+
+
+def test_observation_offset_requires_horizon_plus_offset_source_rows(tmp_path: Path):
+    source_root = tmp_path / "sources"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(_observation_config_text(source_root, tmp_path / "output"))
+    subset = source_root / "source_one"
+    source = subset / "robot/2026/08/18/episode_short_expert/episode.h5"
+    _write_episode(source, frame_count=40)
+
+    description = inspect_source(load_config(config_path), subset, source)
+    assert description.skip_reason == (
+        "all segments are shorter than the action horizon plus target offset"
+    )
+
+
+def _pose_hand_preprocessing_config(tmp_path: Path):
+    config_path = tmp_path / "pose_hand.yaml"
+    config_path.write_text(
+        f"""
+name: pose_hand
+source:
+  root: {tmp_path}
+  subsets: [source]
+  fps: 50
+output:
+  root: {tmp_path / "output"}
+  robot_type: pose_hand
+cameras: {{head: head_rgb}}
+state:
+  - key: eef
+    fields: [pose_pos, pose_rot]
+    rot6d: source_columns_to_groot_rows
+  - key: hand
+    fields: [hand]
+action:
+  source: observation
+  observation_offset: 1
+  horizon: 40
+  preprocessing:
+    enabled: true
+    max_deviation_position: 0.002
+    max_deviation_rotation: 0.01
+    rotation_method: so3_tangent_qp
+    skip_fields: [hand]
+    outlier_filter:
+      enabled: true
+      max_repair_intervals: 32
+      position_step_threshold_m: 0.020
+      position_max_repaired_step_m: 0.005
+      rotation_step_threshold_rad: 0.349066
+      rotation_max_repaired_step_rad: 0.087266
+  keys:
+    - key: eef
+      fields: [pose_pos, pose_rot]
+      rot6d: source_columns_to_groot_rows
+      rep: RELATIVE
+      type: EEF
+      format: XYZ_ROT6D
+      state_key: eef
+    - key: hand
+      fields: [hand]
+      rep: ABSOLUTE
+      type: NON_EEF
+      format: DEFAULT
+"""
+    )
+    config = load_config(config_path)
+    return config, derive_layout(
+        config,
+        {"pose_pos": 3, "pose_rot": 6, "hand": 6},
+        {"pose_pos": 3, "pose_rot": 6, "hand": 6},
+        (8, 8, 3),
+    )
+
+
+def test_target_preprocessing_repairs_so3_and_preserves_hand(tmp_path: Path):
+    from scipy.spatial.transform import Rotation
+
+    config, layout = _pose_hand_preprocessing_config(tmp_path)
+    rows = 50
+    values = np.zeros((rows, 15), dtype=np.float32)
+    matrices = np.repeat(np.eye(3)[None], rows, axis=0)
+    matrices[24] = Rotation.from_euler("z", 90, degrees=True).as_matrix()
+    values[:, 3:9] = np.concatenate([matrices[:, :, 0], matrices[:, :, 1]], axis=1)
+    values[:, 9:15] = np.arange(rows * 6, dtype=np.float32).reshape(rows, 6) / 100.0
+    original = values.copy()
+
+    result = preprocess_action_segment(
+        values,
+        layout=layout,
+        config=config.action.preprocessing,
+        label="synthetic",
+    )
+
+    assert np.array_equal(values, original)
+    assert np.array_equal(result.values[:, 9:15], original[:, 9:15])
+    assert result.evidence["summary"]["rotation_candidate_count"] == 2
+    assert result.evidence["summary"]["rotation_repaired_span_count"] == 1
+    converted = rot6d_source_to_groot(result.values[:, 3:9])
+    decoded = np.stack([EndEffectorPose._rot6d_to_matrix(row) for row in converted])
+    assert np.allclose(decoded @ np.swapaxes(decoded, 1, 2), np.eye(3), atol=1e-6)
+    assert np.allclose(np.linalg.det(decoded), 1.0, atol=1e-6)
+    repaired_steps = (
+        Rotation.from_matrix(decoded[:-1]).inv() * Rotation.from_matrix(decoded[1:])
+    ).magnitude()
+    assert repaired_steps.max() < np.deg2rad(20)
+
+
+def test_target_preprocessing_propagates_solver_failure(tmp_path: Path, monkeypatch):
+    config, layout = _pose_hand_preprocessing_config(tmp_path)
+    values = np.zeros((50, 15), dtype=np.float32)
+    values[:, 3] = 1.0
+    values[:, 7] = 1.0
+
+    def fail_solver(values, maximum_deviation):
+        raise QPSmoothingError("synthetic solver failure")
+
+    monkeypatch.setattr(target_preprocessing_module, "_smooth_field", fail_solver)
+    with pytest.raises(QPSmoothingError, match="synthetic solver failure"):
+        preprocess_action_segment(
+            values,
+            layout=layout,
+            config=config.action.preprocessing,
+            label="solver-failure",
+        )
+
+
+def test_target_preprocessing_rejects_unrepairable_rotation_span(tmp_path: Path):
+    from scipy.spatial.transform import Rotation
+
+    config, layout = _pose_hand_preprocessing_config(tmp_path)
+    outlier = replace(config.action.preprocessing.outlier_filter, max_repair_intervals=2)
+    preprocessing = replace(config.action.preprocessing, outlier_filter=outlier)
+    values = np.zeros((4, 15), dtype=np.float32)
+    matrices = np.stack(
+        [
+            np.eye(3),
+            Rotation.from_euler("z", 180, degrees=True).as_matrix(),
+            Rotation.from_euler("z", 180, degrees=True).as_matrix(),
+            Rotation.from_euler("z", 180, degrees=True).as_matrix(),
+        ]
+    )
+    values[:, 3:9] = np.concatenate([matrices[:, :, 0], matrices[:, :, 1]], axis=1)
+
+    with pytest.raises(ValueError, match="unrepairable action target outlier"):
+        preprocess_action_segment(
+            values,
+            layout=layout,
+            config=preprocessing,
+            label="unrepairable",
+        )
 
 
 def test_discovery_exclusion_matches_substrings_in_relative_paths(tmp_path: Path):
@@ -1038,12 +1306,21 @@ def test_training_command_covers_epoch_max_steps_wandb_fresh_and_resume(
         config, train=replace(config.train, max_steps=7, epochs=None, use_wandb=False)
     )
     resumed, resumed_output, resumed_steps, _ = check_module.build_train_command(
-        max_step_config, datasets, resume_from=resume_directory
+        max_step_config,
+        datasets,
+        resume_from=resume_directory,
+        logging_steps_override=1,
     )
     assert resumed_output == resume_directory
     assert resumed_steps == 7
     assert "--resume-from-checkpoint" in resumed
     assert "--use-wandb" not in resumed
+    assert resumed[resumed.index("--logging-steps") + 1] == "1"
+
+    with pytest.raises(ValueError, match="logging_steps_override must be positive"):
+        check_module.build_train_command(
+            max_step_config, datasets, logging_steps_override=0, now=lambda: instant
+        )
 
     indivisible = replace(config, train=replace(config.train, batch=5))
     with pytest.raises(ValueError, match="must be divisible"):
@@ -1190,3 +1467,34 @@ def test_existing_layout_rejects_semantic_or_chunk_change_without_new_sources(
     info_path.write_text(json.dumps(info))
     with pytest.raises(ValueError, match="feature 'action' differs from stored layout"):
         sync_config(config, workers=1)
+
+
+def test_existing_observation_layout_rejects_target_semantic_change(tmp_path: Path, monkeypatch):
+    import zdata_pipeline.convert as convert_module
+    import zdata_pipeline.source as source_module
+
+    config_path, source_root, _ = _test_config(tmp_path)
+    subset = source_root / "source_one"
+    _write_episode(subset / "robot/2026/08/18/episode_00_expert/episode.h5")
+    config = load_config(config_path)
+    observation_action = replace(config.action, source="observation", observation_offset=1)
+    observation_config = replace(
+        config,
+        action=observation_action,
+        output=replace(config.output, root=tmp_path / "observation_output"),
+    )
+    monkeypatch.setattr(convert_module, "REPO_ROOT", tmp_path / "generated_repo")
+    monkeypatch.setattr(source_module, "_encode_video", _fake_encode_video)
+    assert sync_config(observation_config, workers=1) == 0
+    ledger = json.loads((observation_config.output.root / "_ledgers" / "one.json").read_text())
+    evidence = next(iter(ledger["sources"].values()))["segments"][0]["target_preprocessing"]
+    assert evidence["source"] == "observation"
+    assert evidence["observation_offset"] == 1
+    assert evidence["converted_rows"] == 49
+
+    changed = replace(
+        observation_config,
+        action=replace(observation_config.action, observation_offset=2),
+    )
+    with pytest.raises(ValueError, match="stored observation target semantics differ"):
+        sync_config(changed, workers=1)

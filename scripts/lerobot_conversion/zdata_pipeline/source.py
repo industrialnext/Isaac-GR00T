@@ -18,6 +18,7 @@ import pandas as pd
 from PIL import Image
 
 from .config import PipelineConfig, ResolvedEntry, ResolvedLayout, derive_layout
+from .target_preprocessing import preprocess_action_segment
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class StagedSegment:
     length: int
     parquet: Path
     videos: dict[str, Path]
+    preprocessing: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -76,7 +78,11 @@ def resolve_field_slices(group: h5py.Group) -> dict[str, tuple[int, int]]:
 
 
 def gather_fields(
-    flat: np.ndarray, resolved: dict[str, tuple[int, int]], entries: tuple[ResolvedEntry, ...]
+    flat: np.ndarray,
+    resolved: dict[str, tuple[int, int]],
+    entries: tuple[ResolvedEntry, ...],
+    *,
+    transform_rot6d: bool = True,
 ) -> np.ndarray:
     columns: list[np.ndarray] = []
     for entry in entries:
@@ -89,7 +95,7 @@ def gather_fields(
                     f"field {field_name!r} width {end - start}, expected {expected_width}"
                 )
             block = flat[:, start:end]
-            if field_name == entry.rot6d_field:
+            if transform_rot6d and field_name == entry.rot6d_field:
                 block = rot6d_source_to_groot(block)
             columns.append(block.astype(np.float32, copy=False))
     if not columns:
@@ -102,6 +108,22 @@ def gather_fields(
         )
     if not np.isfinite(result).all():
         raise ValueError("canonical tensor contains non-finite values")
+    return result
+
+
+def transform_gathered_rot6d(values: np.ndarray, entries: tuple[ResolvedEntry, ...]) -> np.ndarray:
+    """Convert rot6d fields in an already gathered canonical tensor."""
+    result = np.asarray(values, dtype=np.float32).copy()
+    for entry in entries:
+        offset = entry.start
+        for field_name, width in entry.fields:
+            if field_name == entry.rot6d_field:
+                result[:, offset : offset + width] = rot6d_source_to_groot(
+                    result[:, offset : offset + width]
+                )
+            offset += width
+    if not np.isfinite(result).all():
+        raise ValueError("canonical tensor contains non-finite values after rot6d conversion")
     return result
 
 
@@ -280,12 +302,16 @@ def inspect_source(config: PipelineConfig, subset: Path, source: Path) -> Source
 
         if "state" not in h5 or "flat" not in h5["state"]:
             raise ValueError("missing state/flat")
-        if "action" not in h5 or config.action.source not in h5["action"]:
-            raise ValueError(f"missing action/{config.action.source}")
         state_slices = resolve_field_slices(h5["state"])
-        action_slices = resolve_field_slices(h5["action"])
         state_flat = h5["state/flat"]
-        action_flat = h5[f"action/{config.action.source}"]
+        if config.action.source == "observation":
+            action_slices = state_slices
+            action_flat = state_flat
+        else:
+            if "action" not in h5 or config.action.source not in h5["action"]:
+                raise ValueError(f"missing action/{config.action.source}")
+            action_slices = resolve_field_slices(h5["action"])
+            action_flat = h5[f"action/{config.action.source}"]
         if (
             state_flat.ndim != 2
             or max(end for _, end in state_slices.values()) > state_flat.shape[1]
@@ -295,7 +321,7 @@ def inspect_source(config: PipelineConfig, subset: Path, source: Path) -> Source
             action_flat.ndim != 2
             or max(end for _, end in action_slices.values()) > action_flat.shape[1]
         ):
-            raise ValueError(f"action field_slices exceed action/{config.action.source} width")
+            raise ValueError(f"action field_slices exceed {config.action.source} target width")
         state_widths = {name: end - start for name, (start, end) in state_slices.items()}
         action_widths = {name: end - start for name, (start, end) in action_slices.items()}
         layout = derive_layout(config, state_widths, action_widths, image_shape)
@@ -318,14 +344,16 @@ def inspect_source(config: PipelineConfig, subset: Path, source: Path) -> Source
                 warning_messages.append(
                     f"frame gap {gap:.1f} ms > {config.warn.frame_gap_ms_above} ms"
                 )
+        minimum_segment_length = config.action.horizon + config.action.observation_offset
         usable_segments = tuple(
-            (start, end) for start, end in segments if end - start >= config.action.horizon
+            (start, end) for start, end in segments if end - start >= minimum_segment_length
         )
         for start, end in segments:
-            if end - start < config.action.horizon:
+            if end - start < minimum_segment_length:
                 warning_messages.append(
-                    f"dropping segment [{start}, {end}) shorter than action horizon "
-                    f"{config.action.horizon}"
+                    f"dropping segment [{start}, {end}) shorter than required source length "
+                    f"{minimum_segment_length} for horizon {config.action.horizon} and offset "
+                    f"{config.action.observation_offset}"
                 )
         if not usable_segments:
             return SourceDescription(
@@ -338,7 +366,7 @@ def inspect_source(config: PipelineConfig, subset: Path, source: Path) -> Source
                 layout=layout,
                 segments=(),
                 warnings=tuple(warning_messages),
-                skip_reason="all segments are shorter than the action horizon",
+                skip_reason="all segments are shorter than the action horizon plus target offset",
             )
 
         for canonical, physical in config.cameras.items():
@@ -457,25 +485,49 @@ def stage_source(
     staged_segments: list[StagedSegment] = []
     with h5py.File(description.path, "r") as h5:
         state = gather_fields(h5["state/flat"][:], resolve_field_slices(h5["state"]), layout.state)
-        action = gather_fields(
-            h5[f"action/{config.action.source}"][:],
-            resolve_field_slices(h5["action"]),
+        if config.action.source == "observation":
+            action_source = h5["state/flat"][:]
+            action_slices = resolve_field_slices(h5["state"])
+        else:
+            action_source = h5[f"action/{config.action.source}"][:]
+            action_slices = resolve_field_slices(h5["action"])
+        raw_action = gather_fields(
+            action_source,
+            action_slices,
             layout.action,
+            transform_rot6d=False,
         )
         elapsed_ms = np.asarray(h5["frame/elapsed_ms"][:], dtype=np.float64)
         done = np.asarray(h5["frame/done"][:], dtype=bool)
         for segment_index, (start, end) in enumerate(description.segments):
             segment_directory = stage_directory / f"segment_{segment_index:03d}"
             parquet = segment_directory / "episode.parquet"
-            segment_done = done[start:end].copy()
+            processed = preprocess_action_segment(
+                raw_action[start:end],
+                layout=layout,
+                config=config.action.preprocessing,
+                label=f"{description.key}#{segment_index}",
+            )
+            offset = config.action.observation_offset
+            converted_end = end - offset
+            segment_action = transform_gathered_rot6d(processed.values[offset:], layout.action)
+            segment_done = done[start:converted_end].copy()
             segment_done[-1] = True
-            frame_count = end - start
+            frame_count = converted_end - start
+            preprocessing_evidence = {
+                **processed.evidence,
+                "source": config.action.source,
+                "observation_offset": offset,
+                "source_start": start,
+                "source_end": end,
+                "converted_rows": frame_count,
+            }
             dataframe = pd.DataFrame(
                 {
-                    "observation.state": list(state[start:end]),
-                    "action": list(action[start:end]),
+                    "observation.state": list(state[start:converted_end]),
+                    "action": list(segment_action),
                     "timestamp": np.asarray(
-                        (elapsed_ms[start:end] - elapsed_ms[start]) / 1000.0,
+                        (elapsed_ms[start:converted_end] - elapsed_ms[start]) / 1000.0,
                         dtype=np.float32,
                     ),
                     "frame_index": np.arange(frame_count, dtype=np.int64),
@@ -487,15 +539,21 @@ def stage_source(
             videos: dict[str, Path] = {}
             for canonical, physical in config.cameras.items():
                 video = segment_directory / f"observation.images.{canonical}.mp4"
-                _encode_video(config, h5, physical, start, end, video)
+                _encode_video(config, h5, physical, start, converted_end, video)
                 videos[canonical] = video
             staged_segments.append(
                 StagedSegment(
                     source_start=start,
-                    source_end=end,
+                    source_end=converted_end,
                     length=frame_count,
                     parquet=parquet,
                     videos=videos,
+                    preprocessing=(
+                        preprocessing_evidence
+                        if config.action.source == "observation"
+                        or config.action.preprocessing.enabled
+                        else None
+                    ),
                 )
             )
     return StagedSource(description=description, segments=tuple(staged_segments))

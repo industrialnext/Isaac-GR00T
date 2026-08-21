@@ -151,6 +151,9 @@ class FinetuneConfig:
     save_steps: int = 1000
     """Frequency (in training steps) at which to save checkpoints."""
 
+    logging_steps: int = 10
+    """Frequency (in training steps) at which to record training metrics."""
+
     save_total_limit: int = 5
     """Maximum number of checkpoints to keep before older ones are deleted."""
 
@@ -211,6 +214,8 @@ class FinetuneConfig:
             raise ValueError(
                 f"gradient_accumulation_steps must be >= 1, got {self.gradient_accumulation_steps}"
             )
+        if self.logging_steps < 1:
+            raise ValueError(f"logging_steps must be >= 1, got {self.logging_steps}")
         if self.gradient_accumulation_steps > 1:
             accumulated_batch_size = self.global_batch_size * self.gradient_accumulation_steps
             warnings.warn(

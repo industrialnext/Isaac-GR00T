@@ -25,6 +25,7 @@ dependencies = [
     "transformers==4.57.3",
     "tyro==0.9.17",
     "click==8.1.8",
+    "clarabel==0.11.1",
     "datasets==3.6.0",
     "cryptography>=46.0.7",
     "einops==0.8.1",

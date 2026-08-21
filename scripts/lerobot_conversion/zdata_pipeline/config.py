@@ -61,10 +61,32 @@ class LayoutEntry:
 
 
 @dataclass(frozen=True)
+class OutlierFilterConfig:
+    enabled: bool = False
+    max_repair_intervals: int | None = None
+    position_step_threshold_m: float | None = None
+    position_max_repaired_step_m: float | None = None
+    rotation_step_threshold_rad: float | None = None
+    rotation_max_repaired_step_rad: float | None = None
+
+
+@dataclass(frozen=True)
+class ActionPreprocessingConfig:
+    enabled: bool = False
+    max_deviation_position: float | None = None
+    max_deviation_rotation: float | None = None
+    rotation_method: str | None = None
+    skip_fields: tuple[str, ...] = ()
+    outlier_filter: OutlierFilterConfig = field(default_factory=OutlierFilterConfig)
+
+
+@dataclass(frozen=True)
 class ActionLayout:
     source: str
     horizon: int
     keys: tuple[LayoutEntry, ...]
+    observation_offset: int = 0
+    preprocessing: ActionPreprocessingConfig = field(default_factory=ActionPreprocessingConfig)
 
 
 @dataclass(frozen=True)
@@ -226,6 +248,129 @@ def _optional_float(value: Any, context: str, *, maximum: float | None = None) -
     return parsed
 
 
+def _required_positive_float(data: dict[str, Any], key: str, context: str) -> float:
+    value = _optional_float(_require(data, key, context), f"{context}.{key}")
+    if value is None or value <= 0:
+        raise ValueError(f"{context}.{key} must be finite and positive")
+    return value
+
+
+def _parse_action_preprocessing(value: Any) -> ActionPreprocessingConfig:
+    if value is None:
+        return ActionPreprocessingConfig()
+    raw = _mapping(value, "action.preprocessing")
+    _warn_unknown(
+        raw,
+        {
+            "enabled",
+            "max_deviation_position",
+            "max_deviation_rotation",
+            "rotation_method",
+            "skip_fields",
+            "outlier_filter",
+        },
+        "action.preprocessing",
+    )
+    enabled = _boolean(raw.get("enabled", False), "action.preprocessing.enabled")
+    if not enabled:
+        if set(raw) - {"enabled"}:
+            raise ValueError("disabled action.preprocessing must not set processing parameters")
+        return ActionPreprocessingConfig()
+
+    rotation_method = _string(
+        _require(raw, "rotation_method", "action.preprocessing"),
+        "action.preprocessing.rotation_method",
+    )
+    if rotation_method != "so3_tangent_qp":
+        raise ValueError("action.preprocessing.rotation_method must be 'so3_tangent_qp'")
+    skip_fields = _string_tuple(
+        raw.get("skip_fields", []),
+        "action.preprocessing.skip_fields",
+        allow_empty_list=True,
+    )
+    outlier_raw = _mapping(
+        _require(raw, "outlier_filter", "action.preprocessing"),
+        "action.preprocessing.outlier_filter",
+    )
+    _warn_unknown(
+        outlier_raw,
+        {
+            "enabled",
+            "max_repair_intervals",
+            "position_step_threshold_m",
+            "position_max_repaired_step_m",
+            "rotation_step_threshold_rad",
+            "rotation_max_repaired_step_rad",
+        },
+        "action.preprocessing.outlier_filter",
+    )
+    outlier_enabled = _boolean(
+        outlier_raw.get("enabled", False),
+        "action.preprocessing.outlier_filter.enabled",
+    )
+    if not outlier_enabled:
+        if set(outlier_raw) - {"enabled"}:
+            raise ValueError("disabled action.preprocessing.outlier_filter must not set parameters")
+        outlier_filter = OutlierFilterConfig()
+    else:
+        max_intervals = _require(
+            outlier_raw,
+            "max_repair_intervals",
+            "action.preprocessing.outlier_filter",
+        )
+        if isinstance(max_intervals, bool) or not isinstance(max_intervals, int):
+            raise ValueError(
+                "action.preprocessing.outlier_filter.max_repair_intervals must be an integer"
+            )
+        if max_intervals < 2:
+            raise ValueError(
+                "action.preprocessing.outlier_filter.max_repair_intervals must be at least 2"
+            )
+        position_threshold = _required_positive_float(
+            outlier_raw, "position_step_threshold_m", "action.preprocessing.outlier_filter"
+        )
+        position_bound = _required_positive_float(
+            outlier_raw,
+            "position_max_repaired_step_m",
+            "action.preprocessing.outlier_filter",
+        )
+        rotation_threshold = _required_positive_float(
+            outlier_raw,
+            "rotation_step_threshold_rad",
+            "action.preprocessing.outlier_filter",
+        )
+        rotation_bound = _required_positive_float(
+            outlier_raw,
+            "rotation_max_repaired_step_rad",
+            "action.preprocessing.outlier_filter",
+        )
+        if position_bound >= position_threshold or rotation_bound >= rotation_threshold:
+            raise ValueError(
+                "action.preprocessing.outlier_filter repaired-step bounds must be smaller "
+                "than detection thresholds"
+            )
+        outlier_filter = OutlierFilterConfig(
+            enabled=True,
+            max_repair_intervals=max_intervals,
+            position_step_threshold_m=position_threshold,
+            position_max_repaired_step_m=position_bound,
+            rotation_step_threshold_rad=rotation_threshold,
+            rotation_max_repaired_step_rad=rotation_bound,
+        )
+    return ActionPreprocessingConfig(
+        enabled=True,
+        max_deviation_position=_required_positive_float(
+            raw, "max_deviation_position", "action.preprocessing"
+        ),
+        max_deviation_rotation=_required_positive_float(
+            raw, "max_deviation_rotation", "action.preprocessing"
+        ),
+        rotation_method=rotation_method,
+        skip_fields=skip_fields,
+        outlier_filter=outlier_filter,
+    )
+
+
 def _layout_entries(value: Any, context: str, *, action: bool) -> tuple[LayoutEntry, ...]:
     if not isinstance(value, list) or not value:
         raise ValueError(f"{context} must be a non-empty list")
@@ -372,14 +517,29 @@ def load_config(path: str | Path) -> PipelineConfig:
 
     state = _layout_entries(_require(data, "state", "config"), "state", action=False)
     action_raw = _mapping(_require(data, "action", "config"), "action")
-    _warn_unknown(action_raw, {"source", "horizon", "keys"}, "action")
+    _warn_unknown(
+        action_raw,
+        {"source", "observation_offset", "horizon", "preprocessing", "keys"},
+        "action",
+    )
+    observation_offset = action_raw.get("observation_offset", 0)
+    if isinstance(observation_offset, bool) or not isinstance(observation_offset, int):
+        raise ValueError("action.observation_offset must be an integer")
     action_layout = ActionLayout(
         source=_string(_require(action_raw, "source", "action"), "action.source"),
         horizon=int(_require(action_raw, "horizon", "action")),
         keys=_layout_entries(_require(action_raw, "keys", "action"), "action.keys", action=True),
+        observation_offset=observation_offset,
+        preprocessing=_parse_action_preprocessing(action_raw.get("preprocessing")),
     )
     if action_layout.horizon <= 0:
         raise ValueError("action.horizon must be positive")
+    if action_layout.observation_offset < 0:
+        raise ValueError("action.observation_offset must be non-negative")
+    if action_layout.source != "observation" and action_layout.observation_offset != 0:
+        raise ValueError("action.observation_offset is only valid for source: observation")
+    if action_layout.source != "observation" and action_layout.preprocessing.enabled:
+        raise ValueError("action.preprocessing is only valid for source: observation")
     state_keys = {entry.key for entry in state}
     for entry in action_layout.keys:
         if entry.rep != "RELATIVE" and entry.state_key is not None:
@@ -391,6 +551,22 @@ def load_config(path: str | Path) -> PipelineConfig:
             raise ValueError(
                 f"action key {entry.key!r} references unknown state key {reference_key!r}"
             )
+    if action_layout.source == "observation":
+        state_fields = {field_name for entry in state for field_name in entry.fields}
+        action_fields = {field_name for entry in action_layout.keys for field_name in entry.fields}
+        missing_fields = sorted(action_fields - state_fields)
+        if missing_fields:
+            raise ValueError(
+                f"observation-derived action fields are absent from state: {missing_fields}"
+            )
+    configured_action_keys = {entry.key for entry in action_layout.keys}
+    unknown_skip_fields = sorted(
+        set(action_layout.preprocessing.skip_fields) - configured_action_keys
+    )
+    if unknown_skip_fields:
+        raise ValueError(
+            f"action.preprocessing.skip_fields contains unknown action keys: {unknown_skip_fields}"
+        )
 
     tasks_raw = _mapping(data.get("tasks", {}), "tasks")
     _warn_unknown(tasks_raw, {"id_attr", "text_attr", "text_overrides"}, "tasks")
@@ -657,6 +833,30 @@ def modality_json(config: PipelineConfig, layout: ResolvedLayout) -> dict[str, A
     }
 
 
+def action_processing_json(config: PipelineConfig) -> dict[str, Any]:
+    """Render observation-target semantics for layout and compatibility checks."""
+    preprocessing = config.action.preprocessing
+    outlier = preprocessing.outlier_filter
+    return {
+        "observation_offset": config.action.observation_offset,
+        "preprocessing": {
+            "enabled": preprocessing.enabled,
+            "max_deviation_position": preprocessing.max_deviation_position,
+            "max_deviation_rotation": preprocessing.max_deviation_rotation,
+            "rotation_method": preprocessing.rotation_method,
+            "skip_fields": list(preprocessing.skip_fields),
+            "outlier_filter": {
+                "enabled": outlier.enabled,
+                "max_repair_intervals": outlier.max_repair_intervals,
+                "position_step_threshold_m": outlier.position_step_threshold_m,
+                "position_max_repaired_step_m": outlier.position_max_repaired_step_m,
+                "rotation_step_threshold_rad": outlier.rotation_step_threshold_rad,
+                "rotation_max_repaired_step_rad": outlier.rotation_max_repaired_step_rad,
+            },
+        },
+    }
+
+
 def layout_json(config: PipelineConfig, layout: ResolvedLayout) -> dict[str, Any]:
     def entries(items: tuple[ResolvedEntry, ...], *, action: bool) -> list[dict[str, Any]]:
         rendered: list[dict[str, Any]] = []
@@ -681,6 +881,13 @@ def layout_json(config: PipelineConfig, layout: ResolvedLayout) -> dict[str, Any
             rendered.append(value)
         return rendered
 
+    action = {
+        "source": config.action.source,
+        "keys": entries(layout.action, action=True),
+        "horizon": config.action.horizon,
+    }
+    if config.action.source == "observation":
+        action.update(action_processing_json(config))
     return {
         "version": 2,
         "output": {
@@ -693,11 +900,7 @@ def layout_json(config: PipelineConfig, layout: ResolvedLayout) -> dict[str, Any
             "pixel_format": config.video.pixel_format,
         },
         "state": entries(layout.state, action=False),
-        "action": {
-            "source": config.action.source,
-            "keys": entries(layout.action, action=True),
-            "horizon": config.action.horizon,
-        },
+        "action": action,
         "fps": config.source.fps,
         "image_shape": list(layout.image_shape),
         "state_slices": {key: list(value) for key, value in layout.state_slices.items()},
@@ -731,6 +934,12 @@ def render_modality_module(config: PipelineConfig) -> str:
     video_keys = "[" + ", ".join(json.dumps(key) for key in config.cameras) + "]"
     state_keys = rendered_keys([entry.key for entry in config.state], 12)
     action_keys = rendered_keys([entry.key for entry in config.action.keys], 12)
+    registration = (
+        f"register_modality_config({config.name}_config, "
+        "embodiment_tag=EmbodimentTag.NEW_EMBODIMENT)"
+    )
+    if len(registration) > 100:
+        registration += "  # fmt: skip"
     return f'''# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -781,7 +990,7 @@ from gr00t.data.types import (
     ),
 }}
 
-register_modality_config({config.name}_config, embodiment_tag=EmbodimentTag.NEW_EMBODIMENT)
+{registration}
 '''
 
 

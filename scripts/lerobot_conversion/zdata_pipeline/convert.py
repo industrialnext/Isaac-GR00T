@@ -24,6 +24,7 @@ from .common import STATS_FILES, assert_output_mutable, transaction_journals
 from .config import (
     PipelineConfig,
     ResolvedLayout,
+    action_processing_json,
     layout_json,
     modality_json,
     modality_module_path,
@@ -368,6 +369,10 @@ def _validate_existing_output(config: PipelineConfig, dataset: Path) -> None:
         or int(action.get("horizon", -1)) != config.action.horizon
     ):
         raise ValueError(f"{dataset}: stored action source/horizon differs from config")
+    if config.action.source == "observation" and any(
+        action.get(key) != value for key, value in action_processing_json(config).items()
+    ):
+        raise ValueError(f"{dataset}: stored observation target semantics differ from config")
     if layout.get("version") == LAYOUT_VERSION:
         if _layout_entry_contract(action.get("keys", []), action=True) != (
             _configured_entry_contract(config, action=True)
@@ -911,8 +916,10 @@ def _sync_locked(
             if description.task_id is None or description.task_text is None:
                 raise ValueError(f"{description.key}: accepted source is missing task metadata")
             task_index = tasks.index_for(config, description.task_id, description.task_text)
-            for assignment in assignments:
+            for assignment, staged_segment in zip(assignments, staged_source.segments, strict=True):
                 assignment["task_index"] = task_index
+                if staged_segment.preprocessing is not None:
+                    assignment["target_preprocessing"] = staged_segment.preprocessing
             current_stat = description.path.stat()
             if (
                 description.source_size_bytes is None
