@@ -104,7 +104,7 @@ train:
   gpus: 4
   batch: 256
   epochs: null
-  max_steps: 40000
+  max_steps: 12000
   lr: 2.8e-4
   workers: 8
   save_steps: 10000
@@ -122,7 +122,7 @@ train:
 serving:
   profile: semihumanoid
   embodiment_tag: new_embodiment
-  model_path: ~/ml_data/outputs/gr00t/semihumanoid_latest/checkpoint-40000
+  model_path: ~/ml_data/outputs/gr00t/semihumanoid_latest/checkpoint-12000
   device: cuda:0
   host: 127.0.0.1
   port: 10012
