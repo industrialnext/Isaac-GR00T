@@ -74,6 +74,7 @@ class ConfigDrivenIndustrialNextProfile:
     eef_frame: str
     gripper_action_keys: tuple[str, ...]
     task_catalog: TaskCatalog
+    neck_joint_names: tuple[str, ...] = ()
 
     @property
     def state_fields(self) -> tuple[str, ...]:
@@ -326,6 +327,18 @@ class ConfigDrivenIndustrialNextProfile:
             "field_lengths": dict(self.field_lengths),
             "field_units": dict(self.field_units),
             "eef_frame": self.eef_frame,
+            "neck": {
+                scope: {
+                    "name": "neck_joint_pos",
+                    "length": len(self.neck_joint_names),
+                    "joint_names": list(self.neck_joint_names),
+                    "units": "rad",
+                    "representation": "absolute",
+                    **({"predicted": True} if scope == "action" else {}),
+                }
+                for scope, fields in (("state", self.state_fields), ("action", self.action_fields))
+                if "neck_joint_pos" in fields and self.neck_joint_names
+            },
         }
 
     def monitoring_gripper_values(
@@ -364,6 +377,7 @@ def load_industrialnext_profile(path: str | Path) -> ConfigDrivenIndustrialNextP
         "field_lengths",
         "ignored_observation_keys",
         "field_units",
+        "neck_joint_names",
         "eef_frame",
         "supported_rtc_modes",
         "gripper_action_keys",
@@ -468,7 +482,33 @@ def load_industrialnext_profile(path: str | Path) -> ConfigDrivenIndustrialNextP
         key not in action_fields for key in gripper_keys
     ):
         raise ValueError("gripper_action_keys must be unique configured action wire fields")
+    neck_joint_names_raw = serving.get("neck_joint_names", [])
+    if not isinstance(neck_joint_names_raw, list) or any(
+        not isinstance(name, str) or not name.strip() for name in neck_joint_names_raw
+    ):
+        raise ValueError("serving.neck_joint_names must be a list of joint names")
+    neck_joint_names = tuple(neck_joint_names_raw)
+    if "neck_joint_pos" in field_lengths:
+        if len(neck_joint_names) != field_lengths["neck_joint_pos"] or len(
+            set(neck_joint_names)
+        ) != len(neck_joint_names):
+            raise ValueError("Head field requires explicit unique matching joint names")
+        if field_units["neck_joint_pos"] != "rad":
+            raise ValueError("neck_joint_pos must use absolute joint radians")
+        for layout in action_layouts:
+            if "neck_joint_pos" in layout.fields:
+                if (
+                    layout.fields != ("neck_joint_pos",)
+                    or layout.rep != "ABSOLUTE"
+                    or layout.action_type != "NON_EEF"
+                    or layout.action_format != "DEFAULT"
+                ):
+                    raise ValueError("Head actions require ABSOLUTE/NON_EEF/DEFAULT")
+    elif neck_joint_names:
+        raise ValueError("neck_joint_names requires neck_joint_pos")
+
     return ConfigDrivenIndustrialNextProfile(
+        neck_joint_names=neck_joint_names,
         name=_string(raw.get("name"), "name"),
         profile_name=_string(serving.get("profile"), "serving.profile"),
         config_path=config_path,

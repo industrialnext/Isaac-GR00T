@@ -154,6 +154,7 @@ class PipelineConfig:
     continuity: ContinuityConfig
     train: TrainingConfig
     config_path: Path
+    neck_joint_names: tuple[str, ...] = ()
 
     def output_name(self, subset_name: str) -> str:
         prefix = self.output.strip_subset_prefix
@@ -706,7 +707,27 @@ def load_config(path: str | Path) -> PipelineConfig:
             f"0 <= value < action.horizon ({action_layout.horizon})"
         )
 
+    neck_selected = any("neck_joint_pos" in entry.fields for entry in (*state, *action_layout.keys))
+    serving = _mapping(data.get("serving", {}), "serving")
+    neck_names = serving.get("neck_joint_names", [])
+    if neck_selected:
+        if (
+            not isinstance(neck_names, list)
+            or not neck_names
+            or any(not isinstance(name, str) or not name.strip() for name in neck_names)
+            or len(set(neck_names)) != len(neck_names)
+        ):
+            raise ValueError("Head conversion requires serving.neck_joint_names")
+        if (
+            any("neck_joint_pos" in entry.fields for entry in action_layout.keys)
+            and action_layout.source != "executed"
+        ):
+            raise ValueError("Head action conversion requires the executed applied-target source")
+    elif neck_names:
+        raise ValueError("neck_joint_names requires a selected neck_joint_pos field")
+
     return PipelineConfig(
+        neck_joint_names=tuple(neck_names),
         name=name,
         source=source,
         output=output,

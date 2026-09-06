@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 from io import BytesIO
+import json
 from pathlib import Path
 import subprocess
 
@@ -51,6 +52,53 @@ class StagedSegment:
 class StagedSource:
     description: SourceDescription
     segments: tuple[StagedSegment, ...]
+
+
+def _validate_neck_source(config: PipelineConfig, h5: h5py.File) -> None:
+    """Require real, fresh applied head targets with the declared joint order."""
+    if not config.neck_joint_names:
+        return
+    quality = json.loads(Path(str(h5.filename)).with_name("episode.qc.json").read_text())
+    if quality["quality_summary"]["final_quality_state"] != "clean":
+        raise ValueError("Degraded episodes cannot train head control")
+    if not bool(h5.attrs.get("valid_for_training", False)):
+        raise ValueError("Head episode is not valid for training")
+    metadata = json.loads(h5["metadata/json"][()])
+    neck = metadata.get("neck", {})
+    if (
+        neck.get("joint_names") != list(config.neck_joint_names)
+        or neck.get("units") != "rad"
+        or neck.get("representation") != "absolute"
+    ):
+        raise ValueError("Head source contract differs from the embodiment configuration")
+    frame_ns = np.asarray(h5["frame/sample_timestamp_ns"], dtype=np.int64)
+    for scope, entries in (("state", config.state), ("action", config.action.keys)):
+        if not any("neck_joint_pos" in entry.fields for entry in entries):
+            continue
+        if scope == "action" and neck.get("action_semantics") != "successful_bus_write_target":
+            raise ValueError("Head actions must be applied bus targets")
+        names = list(h5[f"{scope}/field_names"].asstr()[:])
+        if "neck_joint_pos" not in names:
+            raise ValueError(f"Required head {scope} field is missing")
+        index = names.index("neck_joint_pos")
+        start, end = h5[f"{scope}/field_slices"][index]
+        if end - start != len(config.neck_joint_names):
+            raise ValueError("Head source width differs from its joint order")
+        source = "flat" if scope == "state" else config.action.source
+        values = np.asarray(h5[f"{scope}/{source}"][:, start:end])
+        stamps = np.asarray(h5[f"{scope}/source_timestamp_ns"][:, index], dtype=np.int64)
+        timeout = float(neck[f"{scope}_timeout_sec"])
+        if (
+            not np.isfinite(timeout)
+            or timeout <= 0
+            or not np.isfinite(values).all()
+            or (stamps <= 0).any()
+            or (stamps > frame_ns).any()
+            or ((frame_ns - stamps) / 1e9 > timeout).any()
+        ):
+            raise ValueError(f"Head {scope} data is missing, invalid, or stale")
+        if scope == "state" and not np.asarray(h5["state/present"][:, start:end], dtype=bool).all():
+            raise ValueError("Required head state is absent")
 
 
 def resolve_field_slices(group: h5py.Group) -> dict[str, tuple[int, int]]:
@@ -247,6 +295,7 @@ def inspect_source(config: PipelineConfig, subset: Path, source: Path) -> Source
     warning_messages: list[str] = []
     source_stat = source.stat()
     with h5py.File(source, "r") as h5:
+        _validate_neck_source(config, h5)
         frame_count = int(h5.attrs.get("frame_count", 0))
         if frame_count <= 0:
             raise ValueError(f"frame_count must be positive, got {frame_count}")
@@ -484,6 +533,7 @@ def stage_source(
     layout = description.layout
     staged_segments: list[StagedSegment] = []
     with h5py.File(description.path, "r") as h5:
+        _validate_neck_source(config, h5)
         state = gather_fields(h5["state/flat"][:], resolve_field_slices(h5["state"]), layout.state)
         if config.action.source == "observation":
             action_source = h5["state/flat"][:]
