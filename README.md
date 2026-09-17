@@ -83,6 +83,10 @@ The neural network architecture of GR00T N1.7 is a combination of vision-languag
 4. **Evaluate** — Validate with [open-loop evaluation](#open-loop-evaluation), then test in [simulation benchmarks](#benchmark-examples) or on real hardware via the [Policy API](getting_started/policy.md).
 5. **Deploy** — Connect `Gr00tPolicy` to your robot controller, optionally accelerated with [TensorRT](scripts/deployment/README.md).
 
+For Industrial Next integration, see [internal zdata conversion and training](docs/industrialnext_training.md)
+and [WebSocket serving](docs/industrialnext_serving.md). These guides cover the shared embodiment
+configuration, checkpoint handoff, and compatibility with the internal async robot client.
+
 ## What's New in GR00T N1.7
 
 GR00T N1.7 builds on N1.6 with a new VLM backbone and code-level improvements.
