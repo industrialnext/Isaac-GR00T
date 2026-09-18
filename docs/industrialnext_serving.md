@@ -404,7 +404,8 @@ Implementation owners: [profile_config.py](../gr00t/policy/industrialnext/profil
 
 Use the same variant YAML used for [training](industrialnext_training.md#taro-rgb-v5-fixed-compute-ablation)
 and pass the exact run checkpoint explicitly. There is no shared `latest` pointer.
-The small/full configs default to separate ports 10012/10013. Both use head and two
+Both configs use port 10012; serve only one model at a time. Stop the running server
+before starting the other model. Both use head and two
 fisheye wrist RGB streams; `serving.cameras` maps these live names onto the same
 three model keys used by conversion. External RGB/depth are explicitly ignored.
 

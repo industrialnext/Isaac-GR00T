@@ -84,7 +84,7 @@ serving:
   model_path: outputs/gr00t/taro_exp_full_SELECTED/checkpoint-40000
   device: cuda:0
   host: 127.0.0.1
-  port: 10013
+  port: 10012
   control_hz: 50
   image_size: [256, 256]
   rtc_mode: "off"
