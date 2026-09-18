@@ -46,6 +46,9 @@ class FinetuneConfig:
     """
 
     # --- Model Tuning Flags ---
+    seed: int = 42
+    """Shared model, sampler, and trainer random seed."""
+
     tune_llm: bool = False
     """If True, fine-tune the language model (LLM) backbone during training."""
 

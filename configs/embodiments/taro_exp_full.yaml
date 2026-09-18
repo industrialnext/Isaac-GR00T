@@ -1,0 +1,110 @@
+# Fixed-compute Taro ablation: run preparation before conversion/training.
+name: taro_exp_full
+source:
+  root: data/training_data/rgb_v5/taro_exp_full_rgb_v5/data
+  format: taro_rgb_v5
+  release_manifest_sha256: b7bf9e0e22e3d68ec3b3390e403b40ee2a35fd2d240194a401cbf2bfc52e544a
+  split_manifest: outputs/gr00t/preparation/taro_split.json
+  subsets: [clean_with_ext_cam, clean_without_ext_cam, original_d405, original_fisheye_with_ext_cam, original_fisheye_without_ext_cam]
+  episode_glob: "*/episode.h5"
+  exclude_path_contains: []
+  fps: 50
+output:
+  # Converted LeRobot training data destination (not model checkpoints).
+  root: data/training_data/gr00t/taro_exp_full
+  robot_type: flexiv_taro_20d_bimanual_v1
+  val_every: 0  # Explicit shared capture-group split in source.split_manifest.
+  chunks_size: 1000
+cameras:
+  head: view0_rgb
+  left_wrist: view1_rgb
+  right_wrist: view2_rgb
+video: {codec: libx264, crf: 23, preset: veryfast, pixel_format: yuv420p}
+state:
+  - key: left_eef
+    fields: [left_arm_pose_pos, left_arm_pose_rot]
+    rot6d: source_columns_to_groot_rows
+  - key: right_eef
+    fields: [right_arm_pose_pos, right_arm_pose_rot]
+    rot6d: source_columns_to_groot_rows
+  - {key: right_hand, fields: [right_hand]}
+action:
+  source: expert
+  observation_offset: 0
+  horizon: 40
+  keys:
+    - key: right_eef
+      fields: [right_arm_pose_pos, right_arm_pose_rot]
+      rot6d: source_columns_to_groot_rows
+      rep: RELATIVE
+      type: EEF
+      format: XYZ_ROT6D
+      state_key: right_eef
+    - key: right_hand
+      fields: [right_hand]
+      rep: ABSOLUTE
+      type: NON_EEF
+      format: DEFAULT
+tasks:
+  id_attr: task_uuid
+  text_attr: task_text
+  text_overrides:
+    flexiv_taro_conveyor_belt_pnp: Wait for a target object on the conveyor belt to come within reach, then approach and firmly grasp it with the hand, sort it by color, and drop it into the matching box.
+select:
+  # Projected admission is manifest-bound, not the raw source validity flag.
+  require_valid_for_training: false
+  policy_types: [expert]
+continuity: {split_on_gap_ms: 40}
+train:
+  base_model: outputs/gr00t/models/GR00T-N1.7-3B-2fc962b
+  # Model checkpoints, logs, and per-run metadata are written here.
+  out_base: outputs/gr00t
+  gpus: 2
+  batch: 64
+  epochs: null
+  max_steps: 40000
+  seed: 42
+  lr: 1.0e-4
+  workers: 4
+  save_steps: 1000
+  save_total_limit: 3
+  state_dropout_prob: 0.2
+  shortest_image_edge: 256
+  crop_fraction: 0.95
+  color_jitter: {brightness: 0.15, contrast: 0.15, saturation: 0.2, hue: 0.1}
+  use_wandb: false
+  wandb_project: gr00t-taro-ablation
+  weight_decay: 1.0e-5
+  warmup_ratio: 0.05
+  rtc_training_max_prefix_steps: 0
+serving:
+  profile: taro
+  embodiment_tag: new_embodiment
+  # Explicit --model-path selects the actual run/checkpoint; no shared latest alias.
+  model_path: outputs/gr00t/taro_exp_full_SELECTED/checkpoint-40000
+  device: cuda:0
+  host: 127.0.0.1
+  port: 10013
+  control_hz: 50
+  image_size: [256, 256]
+  rtc_mode: "off"
+  supported_rtc_modes: ["off"]
+  cameras:
+    head: head_rgb
+    left_wrist: eoat_left_top_fisheye_rgb
+    right_wrist: eoat_right_top_fisheye_rgb
+  field_lengths:
+    left_arm_pose_pos: 3
+    left_arm_pose_rot: 6
+    right_arm_pose_pos: 3
+    right_arm_pose_rot: 6
+    right_hand: 20
+  field_units:
+    left_arm_pose_pos: m
+    left_arm_pose_rot: rot6d_columns
+    right_arm_pose_pos: m
+    right_arm_pose_rot: rot6d_columns
+    right_hand: native_joint
+  ignored_observation_keys: [head_depth, eoat_left_top_fisheye_depth, eoat_right_top_fisheye_depth, external_rgb, external_depth]
+  eef_frame: per_arm_flexiv_base
+  gripper_action_keys: []

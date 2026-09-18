@@ -208,6 +208,7 @@ def _check_parquet(
     task_index: int,
     length: int,
     index_offset: int | None = None,
+    masked_supervision: bool = False,
 ) -> pd.DataFrame:
     if not parquet.is_file():
         raise FileNotFoundError(parquet)
@@ -223,10 +224,23 @@ def _check_parquet(
         "next.done",
     }
     missing = required - set(frame.columns)
+    if masked_supervision:
+        missing |= {"action_mask", "observation.state_mask", "observation.valid"} - set(
+            frame.columns
+        )
     if missing:
         raise ValueError(f"{parquet}: missing columns {sorted(missing)}")
     if len(frame) != length:
         raise ValueError(f"{parquet}: length {len(frame)} != metadata length {length}")
+    if masked_supervision:
+        for column, shape in (
+            ("action_mask", (length, action_dim)),
+            ("observation.state_mask", (length, state_dim)),
+            ("observation.valid", (length,)),
+        ):
+            values = np.stack(frame[column])
+            if values.shape != shape or not np.isin(values, [False, True]).all():
+                raise ValueError(f"{parquet}: invalid {column} shape or mask values")
     if np.asarray(frame["observation.state"].iloc[0]).shape != (state_dim,):
         raise ValueError(f"{parquet}: observation.state shape mismatch")
     if np.asarray(frame["action"].iloc[0]).shape != (action_dim,):
@@ -345,6 +359,7 @@ def _check_dataset(
         task_index=int(selected_segment["task_index"]),
         length=int(selected["length"]),
         index_offset=int(selected_segment["index_offset"]),
+        masked_supervision=bool(info.get("masked_supervision")),
     )
     expected_video_keys = {
         value["original_key"].removeprefix("observation.images.")
@@ -378,6 +393,7 @@ def _check_dataset(
                 task_index=int(segment["task_index"]),
                 length=length,
                 index_offset=expected_global,
+                masked_supervision=bool(info.get("masked_supervision")),
             )
             if not np.array_equal(frame["frame_index"].to_numpy(), np.arange(length)):
                 raise ValueError(f"{parquet}: frame_index is not contiguous")
@@ -418,11 +434,23 @@ def check_outputs(config: PipelineConfig, full: bool = False) -> int:
 
 
 def trainable_starts(datasets: list[Path], horizon: int) -> int:
-    return sum(
-        max(0, int(episode["length"]) - horizon + 1)
-        for dataset in datasets
-        for episode in _read_jsonl(dataset / "meta/episodes.jsonl")
-    )
+    starts = 0
+    for dataset in datasets:
+        info = json.loads((dataset / "meta/info.json").read_text())
+        for episode in _read_jsonl(dataset / "meta/episodes.jsonl"):
+            length = max(0, int(episode["length"]) - horizon + 1)
+            if not info.get("masked_supervision"):
+                starts += length
+                continue
+            parquet, _ = _episode_paths(dataset, info, int(episode["episode_index"]))
+            frame = pd.read_parquet(parquet, columns=["observation.valid", "action_mask"])
+            valid = frame["observation.valid"].to_numpy(dtype=bool)[:length]
+            supervised = np.stack(frame["action_mask"]).astype(bool).any(axis=1)
+            indices = np.arange(length)
+            starts += int(
+                (valid & supervised[indices[:, None] + np.arange(horizon)].any(axis=1)).sum()
+            )
+    return starts
 
 
 def _dataset_dimensions(datasets: list[Path]) -> tuple[int, int]:
@@ -534,6 +562,8 @@ def build_train_command(
         str(config.train.save_total_limit),
         "--global-batch-size",
         str(batch),
+        "--seed",
+        str(config.train.seed),
         "--dataloader-num-workers",
         str(config.train.workers),
         "--learning-rate",
@@ -723,6 +753,16 @@ def freeze_corpus(config: PipelineConfig) -> int:
         verify_frozen_corpus(manifest_path)
         print(f"frozen corpus manifest is current: {manifest_path}")
         return 0
+    if config.source.format == "taro_rgb_v5":
+        from .taro_rgb_v5 import release_rows, validate_inventory
+
+        validate_inventory(config)
+        expected = {
+            str((config.source.root.parent / key).resolve()) for key in release_rows(config)
+        }
+        actual = {str(Path(row["path"]).resolve()) for row in _source_stat_inventory(config)}
+        if expected != actual:
+            raise RuntimeError("Cannot freeze an incomplete RGB-v5 conversion")
     _bind_missing_source_stat_guards(config)
     if check_outputs(config, full=True):
         return 1
@@ -747,6 +787,13 @@ def freeze_corpus(config: PipelineConfig) -> int:
         "action_horizon": config.action.horizon,
         "fps": config.source.fps,
     }
+    if config.source.format == "taro_rgb_v5":
+        manifest["converted_artifact_inventory"].extend(
+            [
+                _artifact_record(config.source.split_manifest.resolve()),
+                _artifact_record((config.source.root.parent / "meta/projection.yaml").resolve()),
+            ]
+        )
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = manifest_path.with_name(f".{manifest_path.name}.tmp")
     temporary_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")

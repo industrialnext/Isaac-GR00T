@@ -30,6 +30,9 @@ class SourceConfig:
     episode_glob: str = "*/20*/*/*/*/episode.h5"
     exclude_path_contains: tuple[str, ...] = ("_failed_recordings",)
     fps: int = 50
+    format: str = "zdata_hdf5"
+    release_manifest_sha256: str | None = None
+    split_manifest: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -137,6 +140,7 @@ class TrainingConfig:
     weight_decay: float = 1e-5
     warmup_ratio: float = 0.05
     rtc_training_max_prefix_steps: int = 0
+    seed: int = 42
 
 
 @dataclass(frozen=True)
@@ -461,7 +465,16 @@ def load_config(path: str | Path) -> PipelineConfig:
     source_raw = _mapping(_require(data, "source", "config"), "source")
     _warn_unknown(
         source_raw,
-        {"root", "subsets", "episode_glob", "exclude_path_contains", "fps"},
+        {
+            "root",
+            "subsets",
+            "episode_glob",
+            "exclude_path_contains",
+            "fps",
+            "format",
+            "release_manifest_sha256",
+            "split_manifest",
+        },
         "source",
     )
     source = SourceConfig(
@@ -476,7 +489,18 @@ def load_config(path: str | Path) -> PipelineConfig:
             allow_empty_list=True,
         ),
         fps=int(source_raw.get("fps", 50)),
+        format=source_raw.get("format", "zdata_hdf5"),
+        release_manifest_sha256=source_raw.get("release_manifest_sha256"),
+        split_manifest=_path(source_raw["split_manifest"], "source.split_manifest")
+        if source_raw.get("split_manifest")
+        else None,
     )
+    if source.format not in {"zdata_hdf5", "taro_rgb_v5"}:
+        raise ValueError("unsupported source.format")
+    if source.format == "taro_rgb_v5" and (
+        not source.release_manifest_sha256 or source.split_manifest is None
+    ):
+        raise ValueError("taro_rgb_v5 requires a release digest and prepared split manifest")
     if source.fps <= 0:
         raise ValueError("source.fps must be positive")
 
@@ -659,6 +683,7 @@ def load_config(path: str | Path) -> PipelineConfig:
             "weight_decay",
             "warmup_ratio",
             "rtc_training_max_prefix_steps",
+            "seed",
         },
         "train",
     )
@@ -691,6 +716,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         weight_decay=float(train_raw.get("weight_decay", 1e-5)),
         warmup_ratio=float(train_raw.get("warmup_ratio", 0.05)),
         rtc_training_max_prefix_steps=rtc_training_max_prefix_steps,
+        seed=int(train_raw.get("seed", 42)),
     )
     if train.gpus <= 0 or train.batch <= 0 or train.workers < 0:
         raise ValueError(

@@ -365,6 +365,7 @@ def load_industrialnext_profile(path: str | Path) -> ConfigDrivenIndustrialNextP
         raise ValueError("embodiment config must be a mapping")
     serving = _mapping(raw.get("serving"), "serving")
     serving_keys = {
+        "cameras",
         "profile",
         "embodiment_tag",
         "model_path",
@@ -429,6 +430,11 @@ def load_industrialnext_profile(path: str | Path) -> ConfigDrivenIndustrialNextP
             f"unused={sorted(set(field_lengths) - used_fields)}"
         )
     cameras = _mapping(raw.get("cameras"), "cameras")
+    if "cameras" in serving:
+        wire_cameras = _mapping(serving["cameras"], "serving.cameras")
+        if list(wire_cameras) != list(cameras):
+            raise ValueError("serving.cameras must preserve the model camera keys and order")
+        cameras = wire_cameras
     if not cameras:
         raise ValueError("cameras must not be empty")
     wire_image_to_model = {

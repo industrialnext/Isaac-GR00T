@@ -33,7 +33,7 @@ The [profile loader](../gr00t/policy/industrialnext/profile_config.py) derives:
 
 | Config | Online contract |
 |---|---|
-| `cameras` | Model video key → wire camera name |
+| `cameras` / `serving.cameras` | Model video key → source camera name; optional serving override supplies wire names with identical model keys/order |
 | `state` | Ordered wire fields assembled into model state keys |
 | `action.keys` | Decoded model keys split into ordered wire action fields |
 | `action.horizon`, `action.observation_offset` | Chunk length and target-timestep offset |
@@ -332,3 +332,28 @@ Implementation owners: [profile_config.py](../gr00t/policy/industrialnext/profil
 [async_server.py](../gr00t/policy/industrialnext/async_server.py),
 [Gr00tPolicy](../gr00t/policy/gr00t_policy.py), and the
 [server entry point](../gr00t/eval/run_gr00t_industrialnext_server.py).
+
+## Serving the Taro ablation checkpoints
+
+Use the same variant YAML used for [training](industrialnext_training.md#taro-rgb-v5-fixed-compute-ablation)
+and pass the exact run checkpoint explicitly. There is no shared `latest` pointer.
+The small/full configs default to separate ports 10012/10013. Both use head and two
+fisheye wrist RGB streams; `serving.cameras` maps these live names onto the same
+three model keys used by conversion. External RGB/depth are explicitly ignored.
+
+```bash
+source .venv/bin/activate
+export HF_HUB_CACHE="$PWD/outputs/gr00t/huggingface/hub"
+python gr00t/eval/run_gr00t_industrialnext_server.py \
+  --config configs/embodiments/taro_exp_100.yaml \
+  --model-path outputs/gr00t/EXACT_TARO_100_RUN/checkpoint-40000
+```
+
+The required low-dimensional observations are left/right EEF position (3) and
+source-column rot6d (6), plus the native 20-coordinate `right_hand`, in the order
+bound by `outputs/gr00t/preparation/taro_split.json`. Responses contain right EEF
+and right-hand commands only. Gripper snapping and RTC are disabled. The server
+expects 256×256 JPEG RGB with matching metadata at the 50 Hz control contract.
+Do not copy DEFT's temporal ensemble, fixed action selection offset, or playback
+speed into this baseline. Validate the real deployment's field names, hand order,
+pose frames, image freshness, and latency before robot use.

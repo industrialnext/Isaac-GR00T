@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
+from . import taro_rgb_v5
 from .config import PipelineConfig, ResolvedEntry, ResolvedLayout, derive_layout
 from .target_preprocessing import preprocess_action_segment
 
@@ -296,6 +297,9 @@ def inspect_source(config: PipelineConfig, subset: Path, source: Path) -> Source
     source_stat = source.stat()
     with h5py.File(source, "r") as h5:
         _validate_neck_source(config, h5)
+        if config.source.format == "taro_rgb_v5":
+            taro_rgb_v5.validate_source(config, source, h5)
+            policy_type = h5["episode/policy_type"].asstr()[()]
         frame_count = int(h5.attrs.get("frame_count", 0))
         if frame_count <= 0:
             raise ValueError(f"frame_count must be positive, got {frame_count}")
@@ -371,6 +375,9 @@ def inspect_source(config: PipelineConfig, subset: Path, source: Path) -> Source
             or max(end for _, end in action_slices.values()) > action_flat.shape[1]
         ):
             raise ValueError(f"action field_slices exceed {config.action.source} target width")
+        if config.source.format == "taro_rgb_v5":
+            state_slices = taro_rgb_v5.compact_slices(state_slices)
+            action_slices = taro_rgb_v5.compact_slices(action_slices)
         state_widths = {name: end - start for name, (start, end) in state_slices.items()}
         action_widths = {name: end - start for name, (start, end) in action_slices.items()}
         layout = derive_layout(config, state_widths, action_widths, image_shape)
@@ -387,6 +394,13 @@ def inspect_source(config: PipelineConfig, subset: Path, source: Path) -> Source
             raise ValueError("frame/elapsed_ms is not monotonic")
 
         segments = _segments(elapsed_ms, config.continuity.split_on_gap_ms)
+        if config.source.format == "taro_rgb_v5":
+            taro_rgb_v5.projected_arrays(h5, layout)
+            ids = np.asarray(h5["timing/continuous_segment_id"])
+            cuts = set((np.flatnonzero(np.diff(ids) != 0) + 1).tolist())
+            cuts.update(x for segment in segments for x in segment)
+            cuts = sorted(cuts)
+            segments = tuple(zip(cuts[:-1], cuts[1:]))
         if config.warn.frame_gap_ms_above is not None and len(elapsed_ms) > 1:
             gap = float(np.max(np.diff(elapsed_ms)))
             if gap > config.warn.frame_gap_ms_above:
@@ -534,19 +548,27 @@ def stage_source(
     staged_segments: list[StagedSegment] = []
     with h5py.File(description.path, "r") as h5:
         _validate_neck_source(config, h5)
-        state = gather_fields(h5["state/flat"][:], resolve_field_slices(h5["state"]), layout.state)
-        if config.action.source == "observation":
-            action_source = h5["state/flat"][:]
-            action_slices = resolve_field_slices(h5["state"])
+        projected = config.source.format == "taro_rgb_v5"
+        if projected:
+            state, raw_action, state_validity, action_validity, eligible = (
+                taro_rgb_v5.projected_arrays(h5, layout)
+            )
         else:
-            action_source = h5[f"action/{config.action.source}"][:]
-            action_slices = resolve_field_slices(h5["action"])
-        raw_action = gather_fields(
-            action_source,
-            action_slices,
-            layout.action,
-            transform_rot6d=False,
-        )
+            state = gather_fields(
+                h5["state/flat"][:], resolve_field_slices(h5["state"]), layout.state
+            )
+            if config.action.source == "observation":
+                action_source = h5["state/flat"][:]
+                action_slices = resolve_field_slices(h5["state"])
+            else:
+                action_source = h5[f"action/{config.action.source}"][:]
+                action_slices = resolve_field_slices(h5["action"])
+            raw_action = gather_fields(
+                action_source,
+                action_slices,
+                layout.action,
+                transform_rot6d=False,
+            )
         elapsed_ms = np.asarray(h5["frame/elapsed_ms"][:], dtype=np.float64)
         done = np.asarray(h5["frame/done"][:], dtype=bool)
         for segment_index, (start, end) in enumerate(description.segments):
@@ -584,6 +606,10 @@ def stage_source(
                     "next.done": segment_done,
                 }
             )
+            if projected:
+                dataframe["observation.state_mask"] = list(state_validity[start:converted_end])
+                dataframe["action_mask"] = list(action_validity[start:converted_end])
+                dataframe["observation.valid"] = eligible[start:converted_end]
             parquet.parent.mkdir(parents=True, exist_ok=True)
             dataframe.to_parquet(parquet, index=False)
             videos: dict[str, Path] = {}

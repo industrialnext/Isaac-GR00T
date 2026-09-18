@@ -111,6 +111,7 @@ if __name__ == "__main__":
     config.training.start_from_checkpoint = ft_config.base_model_path
     config.training.optim = "adamw_torch"
     config.training.global_batch_size = ft_config.global_batch_size
+    config.data.seed = ft_config.seed
     config.training.dataloader_num_workers = ft_config.dataloader_num_workers
     config.training.learning_rate = ft_config.learning_rate
     config.training.gradient_accumulation_steps = ft_config.gradient_accumulation_steps

@@ -425,6 +425,7 @@ class TestShardedSingleStepDataset:
             "gr00t.data.dataset.sharded_single_step_dataset.LeRobotEpisodeLoader"
         ) as MockLoader:
             mock_loader = MagicMock()
+            mock_loader.info_meta = {}
             # 3 episodes, 50 steps each
             mock_loader.episode_lengths = [50, 50, 50]
             mock_loader.get_episode_length = lambda idx: 50
@@ -459,6 +460,7 @@ class TestShardedSingleStepDataset:
             "gr00t.data.dataset.sharded_single_step_dataset.LeRobotEpisodeLoader"
         ) as MockLoader:
             mock_loader = MagicMock()
+            mock_loader.info_meta = {}
             mock_loader.episode_lengths = [50]
             mock_loader.get_episode_length = lambda idx: 50
             MockLoader.return_value = mock_loader
@@ -500,6 +502,7 @@ class TestShardedSingleStepDataset:
             "gr00t.data.dataset.sharded_single_step_dataset.LeRobotEpisodeLoader"
         ) as MockLoader:
             mock_loader = MagicMock()
+            mock_loader.info_meta = {}
             # 2 episodes, 50 steps each = 100 total steps
             # With shard_size=1024, ceil(100/1024) = 1, so num_shards = min(1, 2) = 1
             mock_loader.episode_lengths = [50, 50]
@@ -527,6 +530,7 @@ class TestShardedSingleStepDataset:
             "gr00t.data.dataset.sharded_single_step_dataset.LeRobotEpisodeLoader"
         ) as MockLoader:
             mock_loader = MagicMock()
+            mock_loader.info_meta = {}
             # 1 episode, 20 steps, action_horizon=8 -> effective = 20 - 8 + 1 = 13 steps
             mock_loader.episode_lengths = [20]
             mock_loader.get_episode_length = lambda idx: 20
@@ -551,6 +555,7 @@ class TestShardedSingleStepDataset:
             "gr00t.data.dataset.sharded_single_step_dataset.LeRobotEpisodeLoader"
         ) as MockLoader:
             mock_loader = MagicMock()
+            mock_loader.info_meta = {}
             # 5 episodes, 100 steps each = 500 total steps
             # With shard_size=50, ceil(500/50) = 10, but only 5 episodes
             # num_shards = min(10, num_splits) should handle this

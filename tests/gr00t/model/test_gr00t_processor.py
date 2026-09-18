@@ -269,3 +269,16 @@ class TestFixtureCompleteness:
             f"Fixture has fields that save_pretrained() no longer writes: {extra}. "
             f"Remove them from tests/fixtures/processor_config/processor_config.json."
         )
+
+
+def test_projected_action_validity_reaches_loss_and_input(processor, proc_config):
+    step = _make_step_data(proc_config)
+    step.action_validity = {
+        key: np.ones_like(value, dtype=bool) for key, value in step.actions.items()
+    }
+    for mask in step.action_validity.values():
+        mask[0] = False
+    result = processor([{"type": MessageType.EPISODE_STEP.value, "content": step}])
+    assert not result["action_mask"][0].any()
+    assert not result["action"][0].any()
+    assert result["action_mask"][1].any()

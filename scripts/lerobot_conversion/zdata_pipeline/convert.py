@@ -73,6 +73,14 @@ class TaskTable:
         return index
 
 
+def source_split(config: PipelineConfig, source: Path, key: str) -> str:
+    if config.source.format == "taro_rgb_v5":
+        from .taro_rgb_v5 import split_for_source
+
+        return split_for_source(config, source)
+    return assign_split(key, config.output.val_every)
+
+
 def _read_json(path: Path) -> dict:
     with path.open() as stream:
         return json.load(stream)
@@ -398,6 +406,8 @@ def _validate_existing_output(config: PipelineConfig, dataset: Path) -> None:
 
     with (dataset / "meta/info.json").open() as stream:
         info = json.load(stream)
+    if bool(info.get("masked_supervision")) != (config.source.format == "taro_rgb_v5"):
+        raise ValueError(f"{dataset}: supervision mask contract differs from config")
     state_dim = max((int(end) for _, end in layout.get("state_slices", {}).values()), default=0)
     action_dim = max((int(end) for _, end in layout.get("action_slices", {}).values()), default=0)
     expected_paths = {
@@ -541,6 +551,19 @@ def _metadata(
             **video_features,
         },
     }
+    if config.source.format == "taro_rgb_v5":
+        info["masked_supervision"] = True
+        info["features"]["action_mask"] = {
+            "dtype": "bool",
+            "shape": [layout.action_dim],
+            "names": None,
+        }
+        info["features"]["observation.state_mask"] = {
+            "dtype": "bool",
+            "shape": [layout.state_dim],
+            "names": None,
+        }
+        info["features"]["observation.valid"] = {"dtype": "bool", "shape": [1], "names": None}
     return {
         "meta/info.json": json.dumps(info, indent=4) + "\n",
         "meta/modality.json": json.dumps(modality_json(config, layout), indent=4) + "\n",
@@ -623,6 +646,11 @@ def _prepare_dataset_transaction(
                     "task_index",
                     "next.done",
                 ]
+                + (
+                    ["action_mask", "observation.state_mask", "observation.valid"]
+                    if config.source.format == "taro_rgb_v5"
+                    else []
+                )
             ]
             staged_parquet = transaction_directory / "data" / f"episode_{episode_index:06d}.parquet"
             staged_parquet.parent.mkdir(parents=True, exist_ok=True)
@@ -759,6 +787,10 @@ def _sync_locked(
     *,
     dry_run: bool,
 ) -> int:
+    if config.source.format == "taro_rgb_v5":
+        from .taro_rgb_v5 import validate_inventory
+
+        validate_inventory(config)
     _validate_existing_outputs(config)
     module_path = modality_module_path(config, REPO_ROOT)
     module_text = render_modality_module(config)
@@ -835,7 +867,7 @@ def _sync_locked(
                 split = (
                     old["segments"][0]["split"]
                     if old and old.get("status") == "complete"
-                    else assign_split(key, config.output.val_every)
+                    else source_split(config, source, key)
                 )
                 dataset_name = name if split == "train" else f"{name}_val"
                 direct = _layout_for_description(config, description)
@@ -888,7 +920,7 @@ def _sync_locked(
                 split = str(old_segments[0]["split"])
                 assignments = deepcopy(old_segments)
             else:
-                split = assign_split(description.key, config.output.val_every)
+                split = source_split(config, description.path, description.key)
                 dataset_name = name if split == "train" else f"{name}_val"
                 if dataset_name not in next_values:
                     next_values[dataset_name] = _next_indices(ledger, dataset_name)

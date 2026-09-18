@@ -634,6 +634,14 @@ class Gr00tN1d7Processor(BaseProcessor):
             action_mask = torch.ones_like(normalized_actions)
             action_mask[action_horizon:] = 0
             action_mask[:, action_dim:] = 0
+            if content.action_validity is not None:
+                validity = torch.from_numpy(
+                    np.concatenate([content.action_validity[key] for key in action_keys], axis=-1)
+                ).to(dtype=action_mask.dtype)
+                if validity.shape != (action_horizon, action_dim):
+                    raise ValueError("Action supervision mask shape differs from actions")
+                action_mask[:action_horizon, :action_dim] *= validity
+                normalized_actions = normalized_actions.masked_fill(action_mask == 0, 0)
         else:
             assert not self.training, "Action is required in training mode"
             normalized_actions = None

@@ -73,6 +73,21 @@ def extract_step_data(
         masks=mask_data if mask_data else None,
         states=state_data,
         actions=action_data,
+        action_validity={
+            key: np.stack(
+                episode_data[f"action_validity.{key}"].iloc[
+                    [
+                        min(max(step_index + delta, 0), len(episode_data) - 1)
+                        if allow_padding
+                        else step_index + delta
+                        for delta in modality_configs["action"].delta_indices
+                    ]
+                ]
+            ).astype(bool)
+            for key in action_data
+        }
+        if any(c.startswith("action_validity.") for c in episode_data.columns)
+        else None,
         text=text,
         embodiment=embodiment_tag,
     )
@@ -185,6 +200,21 @@ class ShardedSingleStepDataset(ShardedDataset):
         total_steps = 0
         for ep_idx in shuffled_episode_indices:
             step_indices = np.arange(0, self.get_effective_episode_length(ep_idx))
+            if self.episode_loader.info_meta.get("masked_supervision"):
+                df = self.episode_loader._load_parquet_data(
+                    self.episode_loader.episodes_metadata[ep_idx]["episode_index"]
+                )
+                valid = np.asarray(df["observation.valid"], dtype=bool)
+                supervised = np.stack(
+                    [
+                        np.stack(df[f"action_validity.{key}"]).any(axis=1)
+                        for key in self.modality_configs["action"].modality_keys
+                    ]
+                ).any(axis=0)
+                offsets = np.asarray(self.modality_configs["action"].delta_indices)
+                step_indices = step_indices[
+                    valid[step_indices] & supervised[step_indices[:, None] + offsets].any(axis=1)
+                ]
             self.rng.shuffle(step_indices)
             total_steps += len(step_indices)
             for i in range(num_splits):

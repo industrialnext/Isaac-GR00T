@@ -44,7 +44,13 @@ from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
 from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
 from gr00t.data.state_action.action_chunking import EndEffectorActionChunk, JointActionChunk
 from gr00t.data.state_action.pose import EndEffectorPose, JointPose
-from gr00t.data.types import ActionRepresentation, ActionType, EmbodimentTag, ModalityConfig
+from gr00t.data.types import (
+    ActionFormat,
+    ActionRepresentation,
+    ActionType,
+    EmbodimentTag,
+    ModalityConfig,
+)
 from gr00t.data.utils import to_json_serializable
 
 
@@ -134,6 +140,20 @@ def _dump_stats_cache_atomic(path: Path, data: dict[str, Any], *, indent: int | 
         raise
 
 
+def masked_statistics(values: np.ndarray, axis: int = 0) -> dict:
+    """NaNs denote excluded coordinates, never zero-valued training examples."""
+    if not np.isfinite(values).any(axis=axis).all():
+        raise ValueError("No valid supervision for one or more statistics coordinates")
+    return {
+        "mean": np.nanmean(values, axis=axis).tolist(),
+        "std": np.nanstd(values, axis=axis).tolist(),
+        "min": np.nanmin(values, axis=axis).tolist(),
+        "max": np.nanmax(values, axis=axis).tolist(),
+        "q01": np.nanquantile(values, 0.01, axis=axis).tolist(),
+        "q99": np.nanquantile(values, 0.99, axis=axis).tolist(),
+    }
+
+
 def calculate_dataset_statistics(
     parquet_paths: list[Path], features: list[str] | None = None
 ) -> dict[str, dict[str, float]]:
@@ -169,14 +189,15 @@ def calculate_dataset_statistics(
         np_data = np.vstack(
             [np.asarray(x, dtype=np.float32) for x in all_low_dim_data[le_modality]]
         )
-        dataset_statistics[le_modality] = dict(
-            mean=np.mean(np_data, axis=0).tolist(),
-            std=np.std(np_data, axis=0).tolist(),
-            min=np.min(np_data, axis=0).tolist(),
-            max=np.max(np_data, axis=0).tolist(),
-            q01=np.quantile(np_data, 0.01, axis=0).tolist(),
-            q99=np.quantile(np_data, 0.99, axis=0).tolist(),
+        mask_column = {"action": "action_mask", "observation.state": "observation.state_mask"}.get(
+            le_modality
         )
+        if mask_column in all_low_dim_data:
+            mask = np.stack(all_low_dim_data[mask_column]).astype(bool)
+            if mask.shape != np_data.shape:
+                raise ValueError(f"{mask_column} has an incorrect shape")
+            np_data = np.where(mask, np_data, np.nan)
+        dataset_statistics[le_modality] = masked_statistics(np_data)
     return dataset_statistics
 
 
@@ -291,6 +312,38 @@ def generate_stats(dataset_path: Path | str):
     _dump_stats_cache_atomic(stats_path, existing)
 
 
+def relative_rot6d_windows(states, actions, starts, offsets):
+    """Batch T_state^-1 T_action, reusing the canonical pose decoder once per row."""
+    from scipy.spatial.transform import Rotation
+
+    if not len(starts):
+        return np.empty((0, len(offsets), 9), dtype=np.float32)
+    state_poses = np.stack(
+        [
+            EndEffectorPose.from_action_format(row, ActionFormat.XYZ_ROT6D).homogeneous
+            for row in states
+        ]
+    )
+    action_poses = np.stack(
+        [
+            EndEffectorPose.from_action_format(row, ActionFormat.XYZ_ROT6D).homogeneous
+            for row in actions
+        ]
+    )
+    targets = action_poses[starts[:, None] + offsets]
+    inverse_rotation = state_poses[starts, :3, :3].transpose(0, 2, 1)
+    translations = np.einsum(
+        "nij,nhj->nhi", inverse_rotation, targets[:, :, :3, 3] - state_poses[starts, None, :3, 3]
+    )
+    rotations = inverse_rotation[:, None] @ targets[:, :, :3, :3]
+    rotations = (
+        Rotation.from_matrix(rotations.reshape(-1, 3, 3)).as_matrix().reshape(rotations.shape)
+    )
+    return np.concatenate(
+        [translations, rotations[:, :, :2, :].reshape(len(starts), len(offsets), 6)], axis=-1
+    ).astype(np.float32)
+
+
 class RelativeActionLoader:
     def __init__(self, dataset_path: Path | str, embodiment_tag: EmbodimentTag, action_key: str):
         self.dataset_path = Path(dataset_path)
@@ -337,7 +390,20 @@ class RelativeActionLoader:
         trajectories = []
         usable_length = len(df) - self.modality_configs["action"].delta_indices[-1]
         action_delta_indices = np.array(self.modality_configs["action"].delta_indices)
+        if (
+            self.loader.info_meta.get("masked_supervision")
+            and self.action_config.type == ActionType.EEF
+            and self.action_config.format == ActionFormat.XYZ_ROT6D
+            and self.modality_configs["state"].delta_indices == [0]
+        ):
+            starts = np.flatnonzero(np.asarray(df["observation.valid"], dtype=bool)[:usable_length])
+            values = relative_rot6d_windows(state_data, action_data, starts, action_delta_indices)
+            mask = np.stack(df[f"action_validity.{self.action_key}"]).astype(bool)
+            values = np.where(mask[starts[:, None] + action_delta_indices], values, np.nan)
+            return list(values)
         for i in range(usable_length):
+            if "observation.valid" in df and not bool(df["observation.valid"].iloc[i]):
+                continue
             state_ind = self.modality_configs["state"].delta_indices[-1] + i
             action_inds = action_delta_indices + i
             last_state = state_data[state_ind]
@@ -357,6 +423,10 @@ class RelativeActionLoader:
                 trajectories.append(np.stack([p.joints for p in traj.poses], dtype=np.float32))
             else:
                 raise ValueError(f"Unknown ActionType: {self.action_config.type}")
+            validity_key = f"action_validity.{self.action_key}"
+            if validity_key in df:
+                validity = np.stack(df[validity_key].iloc[action_inds]).astype(bool)
+                trajectories[-1] = np.where(validity, trajectories[-1], np.nan)
         return trajectories
 
     def __len__(self) -> int:
@@ -376,12 +446,7 @@ def calculate_stats_for_key(
             break
         trajectories.extend(loader.load_relative_actions(episode_id))
     return {
-        "max": np.max(trajectories, axis=0),
-        "min": np.min(trajectories, axis=0),
-        "q01": np.quantile(trajectories, 0.01, axis=0),
-        "q99": np.quantile(trajectories, 0.99, axis=0),
-        "mean": np.mean(trajectories, axis=0),
-        "std": np.std(trajectories, axis=0),
+        key: np.asarray(value) for key, value in masked_statistics(np.asarray(trajectories)).items()
     }
 
 

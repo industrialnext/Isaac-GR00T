@@ -66,7 +66,7 @@ The xArm example enables target preprocessing; copying it also copies that choic
 | `name` | Python identifier; also names the generated example module |
 | `source` | Root, subsets/globs, episode glob, excluded path fragments, sampling FPS |
 | `output` | Converted root, robot type, subset-prefix removal, `val_every`, chunk size |
-| `cameras` | Ordered model video key → source HDF5 / live wire camera name |
+| `cameras` | Ordered model video key → source HDF5 camera name; optional `serving.cameras` supplies live aliases |
 | `state` | Ordered model keys and source field groups |
 | `action` | Source, observation offset, horizon, optional preprocessing, ordered action keys and representations |
 | `tasks` | Source task attributes and explicit UUID → instruction overrides |
@@ -303,3 +303,103 @@ uv run --no-sync --with h5py python -m pytest \
 Optional source survey helpers live beside the converter, but inspect their source-path
 assumptions before using them for a new embodiment. GPU training, checkpoint evaluation,
 WebSocket loopback, and real ROS validation establish different parts of readiness.
+
+## Taro RGB-v5 fixed-compute ablation
+
+Use [taro_exp_100.yaml](../configs/embodiments/taro_exp_100.yaml) and
+[taro_exp_full.yaml](../configs/embodiments/taro_exp_full.yaml). These mirror the
+source roots, task, embodiment, command targets, and disabled external cameras in
+`industrialnext_ai/config/manipulation/semihumanoid/deft1_0_2b_taro_exp_{100,full}.yaml`.
+They fine-tune the pretrained N1.7 model; they do not train a foundation model from scratch.
+
+| Setting | Both variants |
+|---|---|
+| Starting checkpoint | `nvidia/GR00T-N1.7-3B`, revision `2fc962b973bccdd5d8ce4f67cc63b264d6886495` |
+| Model RGB keys / projected source groups | head / view0_rgb; left_wrist / view1_rgb; right_wrist / view2_rgb |
+| State / action width | 38: bilateral EEF + right hand / 29: right EEF + right hand |
+| Hand coordinates | First 20 source-native coordinates; exclude five padded coordinates |
+| Target | Same-row `action/expert`, offset 0, 40 steps at 50 Hz; relative right EEF, absolute native hand |
+| Optimizer budget | 40,000 steps, global batch 64, two GPUs per run, accumulation 1: 2,560,000 sampled windows |
+| Seed / learning rate | 42 / 1e-4; warmup ratio 0.05, weight decay 1e-5 |
+| Trainable components | Projector and action decoder; language/vision backbone frozen |
+| RTC | Prefix training disabled; serve with RTC off |
+| Converted roots | `data/training_data/gr00t/taro_exp_100` and `.../taro_exp_full` |
+| Run roots | Separate timestamped `outputs/gr00t/taro_exp_100_*` and `taro_exp_full_*` |
+
+`output.root` is the **converted dataset destination**, not the checkpoint directory.
+`train.out_base` is the **model checkpoint/log destination**. For these two configs,
+converted LeRobot data stays under `data/training_data/gr00t/`, and all model runs
+stay under `outputs/gr00t/`. Both resolve to the intended NVMe storage. The released small
+corpus has 100 episodes / 75,451 frames. Full has 1,510 entries / 1,268,680 frames,
+including cleaned/original versions of some recordings. Keep that composition;
+do not silently deduplicate it.
+
+The preparation script binds each release manifest digest and source size/mtime,
+verifies native hand declarations, and creates a common evaluation cohort. It joins
+source episode identities and full capture paths (removing numbered part suffixes).
+All small-corpus captures remain in training; 10% of the full-only capture groups,
+ranked deterministically with seed 42, become the shared holdout. The current split
+is 100 small training entries, 1,429 full training entries, and 81 shared evaluation
+entries stored under the full output's `*_val` datasets. Related original/cleaned
+entries cannot cross this boundary. This is a proposed offline evaluation cohort,
+not a claim of independent robot trials or balanced coverage of every source pool.
+
+The `taro_rgb_v5` adapter requires released projected admission, rather than the
+raw source `valid_for_training` flag. It intersects action supervision, presence,
+value, and ownership masks. Invalid EEF poses receive arithmetic placeholders with
+zero loss weight. Parquet masks survive statistics, the real loader, and model loss;
+invalid selected state or RGB excludes an observation start. Individual invalid
+future action coordinates remain masked without discarding an entire 40-step window.
+Training statistics are fitted separately to each training variant; evaluation
+must use the evaluated checkpoint's saved processor/statistics, never refit on holdout.
+
+Prepare from the repository root (these commands do not start full training):
+
+```bash
+source .venv/bin/activate
+# Required after uv sync, which removes this conversion-only dependency:
+uv pip install h5py
+# Preserve existing HF credentials while placing downloaded assets on NVMe.
+export HF_HUB_CACHE="$PWD/outputs/gr00t/huggingface/hub"
+python - <<'PYTHON'
+from huggingface_hub import snapshot_download
+snapshot_download(
+    "nvidia/GR00T-N1.7-3B",
+    revision="2fc962b973bccdd5d8ce4f67cc63b264d6886495",
+    local_dir="outputs/gr00t/models/GR00T-N1.7-3B-2fc962b",
+    allow_patterns=["*.json", "*.safetensors", "*.yaml", "LICENSE", "README.md"],
+)
+PYTHON
+python scripts/lerobot_conversion/prepare_taro_ablation.py
+for variant in 100 full; do
+  config="configs/embodiments/taro_exp_${variant}.yaml"
+  python scripts/lerobot_conversion/run_zdata_pipeline.py --config "$config" sync --workers 12
+  python scripts/lerobot_conversion/run_zdata_pipeline.py --config "$config" stats --jobs 4
+  python scripts/lerobot_conversion/run_zdata_pipeline.py --config "$config" check --full
+  python scripts/lerobot_conversion/run_zdata_pipeline.py --config "$config" train --smoke-max-steps 30 --smoke-batch 16
+  python scripts/lerobot_conversion/run_zdata_pipeline.py --config "$config" freeze
+done
+```
+
+Download the pinned base to `outputs/gr00t/models/GR00T-N1.7-3B-2fc962b` before the
+smokes. Loading its Cosmos-Reason2-2B processor also requires authorized Hugging Face
+access. The short smokes use one GPU and batch 16; the full runs use batch 32 per
+GPU. Smoke losses are initialization checks, not ablation results.
+
+After preparation, launch both variants on disjoint GPU pairs, in separate shells:
+
+```bash
+# tmux pane 1:0.0: starts the 40,000-step small-corpus run.
+CUDA_VISIBLE_DEVICES=0,1 python scripts/lerobot_conversion/run_zdata_pipeline.py \
+  --config configs/embodiments/taro_exp_100.yaml train --freeze
+
+# tmux pane 1:0.1: starts the 40,000-step full-corpus run.
+CUDA_VISIBLE_DEVICES=2,3 python scripts/lerobot_conversion/run_zdata_pipeline.py \
+  --config configs/embodiments/taro_exp_full.yaml train --freeze
+```
+
+Each fresh run starts from the same base, records its config/corpus identity, and
+writes to its own timestamped directory. Do not resume the other variant's checkpoint.
+Use the same optimizer-step checkpoint for comparison. The DEFT `action_offset: 4`
+and `speed_factor: 1.2` are serving execution choices, not an HDF5 target offset;
+they are not applied to this GR00T baseline.

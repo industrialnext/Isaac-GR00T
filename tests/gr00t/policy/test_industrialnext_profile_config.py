@@ -139,3 +139,26 @@ def test_profile_rejects_unknown_layout_keys(tmp_path: Path) -> None:
 def test_task_catalog_mapping_rejects_non_mapping_display_names() -> None:
     with pytest.raises(ValueError, match="display_names must be a mapping"):
         task_catalog_from_mapping("test", {"pick": "Pick it."}, display_names=cast(Any, "Pick"))
+
+
+@pytest.mark.parametrize("variant", ["100", "full"])
+def test_taro_uses_three_live_views_and_native_hand(variant):
+    profile = load_industrialnext_profile(f"configs/embodiments/taro_exp_{variant}.yaml")
+    assert dict(profile.wire_image_to_model) == {
+        "head_rgb": "head",
+        "eoat_left_top_fisheye_rgb": "left_wrist",
+        "eoat_right_top_fisheye_rgb": "right_wrist",
+    }
+    assert profile.field_lengths["right_hand"] == 20
+    assert profile.action_fields == ("right_arm_pose_pos", "right_arm_pose_rot", "right_hand")
+    assert profile.action_start_offset_steps == 0
+    assert profile.supported_rtc_modes == ("off",)
+
+
+def test_serving_camera_aliases_cannot_change_model_order(tmp_path):
+    raw = yaml.safe_load(Path("configs/embodiments/taro_exp_100.yaml").read_text())
+    raw["serving"]["cameras"] = dict(reversed(list(raw["serving"]["cameras"].items())))
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(raw, sort_keys=False))
+    with pytest.raises(ValueError, match="preserve the model camera keys and order"):
+        load_industrialnext_profile(path)

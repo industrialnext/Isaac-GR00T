@@ -69,6 +69,8 @@ class VLAStepData:
     )  # Optional embodiment tag for cross-embodiment training
     is_demonstration: bool = False  # Whether the step is a demonstration. If True, no loss should be computed for this step.
 
+    action_validity: dict[str, np.ndarray] | None = None
+
     # Flexible metadata that can be extended by users
     metadata: dict[str, Any] = field(default_factory=dict)
 

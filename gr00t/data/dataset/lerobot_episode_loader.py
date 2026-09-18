@@ -395,6 +395,29 @@ class LeRobotEpisodeLoader:
             for joint_group in joint_groups_df.columns:
                 loaded_df[f"{modality_type}.{joint_group}"] = joint_groups_df[joint_group]
 
+        if self.info_meta.get("masked_supervision"):
+            for column in ("action_mask", "observation.state_mask", "observation.valid"):
+                if column not in original_df:
+                    raise ValueError(f"Missing required supervision column {column}")
+            loaded_df["observation.valid"] = original_df["observation.valid"]
+            for modality, column in (
+                ("action", "action_mask"),
+                ("state", "observation.state_mask"),
+            ):
+                if modality not in self.modality_configs:
+                    continue
+                masked = original_df.copy(deep=False)
+                for key in self.modality_configs[modality].modality_keys:
+                    meta = self.modality_meta[modality][key]
+                    original_key = meta.get(
+                        "original_key", "action" if modality == "action" else "observation.state"
+                    )
+                    masked[original_key] = original_df[column]
+                groups = self._extract_joint_groups(
+                    masked, self.modality_configs[modality].modality_keys, modality
+                )
+                for key in groups:
+                    loaded_df[f"{modality}_validity.{key}"] = groups[key]
         return loaded_df
 
     def _load_video_data(self, episode_index: int, indices: np.ndarray) -> dict[str, np.ndarray]:
