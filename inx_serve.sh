@@ -21,6 +21,9 @@ if [[ ! -f packages/industrialnext_rpc/pyproject.toml ]]; then
 fi
 
 export HF_HUB_CACHE="$PWD/outputs/gr00t/huggingface/hub"
+# These switches are read when gr00t is first imported.
+export GROOT_HF_LOCAL_FIRST=1
+export GROOT_PATCH_MISTRAL=1
 export CUDA_VISIBLE_DEVICES="${SERVING_GPU:-0}"
 
 exec uv run --locked --extra industrialnext python \
