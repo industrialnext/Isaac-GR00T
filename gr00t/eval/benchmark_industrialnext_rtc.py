@@ -5,21 +5,24 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
-from dataclasses import dataclass, field
+import asyncio
+from dataclasses import dataclass, field, replace
+import hashlib
 import json
 import math
 from pathlib import Path
+import platform
+import subprocess
 import time
 from typing import Any
 
 from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
-from gr00t.data.dataset.sharded_single_step_dataset import extract_step_data
 from gr00t.data.embodiment_tags import EmbodimentTag
-from gr00t.data.utils import parse_observation_gr00t
+from gr00t.eval.industrialnext_replay import replay_production
 from gr00t.eval.run_gr00t_industrialnext_server import build_service_provenance
 from gr00t.policy.gr00t_policy import Gr00tPolicy
-from gr00t.policy.industrialnext import ACTION_HORIZON, build_synthetic_model_observation
+from gr00t.policy.industrialnext import ACTION_HORIZON, load_industrialnext_profile
+from gr00t.policy.industrialnext.async_server import IndustrialNextServingConfig
 import numpy as np
 import torch
 import tyro
@@ -35,7 +38,17 @@ class BenchmarkConfig:
     embodiment_tag: str = "new_embodiment"
     device: str = "cuda"
     task_text: str = "Pick the grounded target object."
-    modes: list[str] = field(default_factory=lambda: list(SUPPORTED_MODES))
+    modes: list[str] = field(default_factory=lambda: ["off"])
+    profile_config: str = "configs/embodiments/semihumanoid.yaml"
+    action_offset: int = 2
+    ensemble_strategy: str = "temporal_exponential"
+    ensemble_coeff: float = 0.1
+    max_ensemble_chunks: int = 3
+    chunk_transition_frames: int = 4
+    run_ablations: bool = True
+    min_usable_action_steps: int = 1
+    max_action_lateness_s: float = 0.04
+    max_control_clock_drift_s: float = 0.1
     warmup_calls: int = 5
     steady_calls: int = 100
     control_hz: float = 50.0
@@ -48,7 +61,7 @@ class BenchmarkConfig:
     rtc_gripper_tolerance: float = 1e-4
     seeds: list[int] = field(default_factory=lambda: [0, 1, 2])
     dataset_path: str | None = None
-    trajectory_ids: list[int] = field(default_factory=lambda: [0])
+    trajectory_ids: list[int] | None = None
     replay_steps: int = 100
     delay_trace: list[int] = field(default_factory=lambda: [4, 4, 5, 4, 6, 4])
     run_latency: bool = True
@@ -61,8 +74,8 @@ class BenchmarkConfig:
             raise ValueError(f"modes must be selected from {SUPPORTED_MODES}")
         if self.warmup_calls < 0 or self.steady_calls <= 0:
             raise ValueError("warmup_calls must be non-negative and steady_calls must be positive")
-        if not math.isfinite(self.control_hz) or self.control_hz <= 0:
-            raise ValueError("control_hz must be finite and positive")
+        if self.control_hz != 50.0:
+            raise ValueError("control_hz must be exactly 50.0 for production replay")
         if not 1 <= self.prefix_steps <= ACTION_HORIZON - self.min_new_tail_steps:
             raise ValueError("prefix_steps must leave min_new_tail_steps")
         if (
@@ -73,8 +86,17 @@ class BenchmarkConfig:
             raise ValueError("native_overlap_steps must cover prefix_steps and leave a new tail")
         if not self.seeds or any(not isinstance(seed, int) for seed in self.seeds):
             raise ValueError("seeds must be a non-empty integer list")
-        if not self.delay_trace or any(delay < 1 for delay in self.delay_trace):
+        if not self.delay_trace or any(
+            isinstance(delay, bool) or not isinstance(delay, int) or delay < 1
+            for delay in self.delay_trace
+        ):
             raise ValueError("delay_trace must contain positive committed-step lengths")
+        if (
+            isinstance(self.replay_steps, bool)
+            or not isinstance(self.replay_steps, int)
+            or self.replay_steps < 1
+        ):
+            raise ValueError("replay_steps must be a positive integer")
         for name in (
             "rtc_position_tolerance",
             "rtc_orientation_tolerance_rad",
@@ -153,12 +175,16 @@ def benchmark_checkpoint_latency(
     config: BenchmarkConfig,
     checkpoint_config: dict[str, Any],
 ) -> dict[str, Any]:
-    observation = build_synthetic_model_observation(config.task_text)
+    profile = load_industrialnext_profile(config.profile_config)
+    profile.assert_policy_contract(policy)
+    observation = profile.build_synthetic_model_observation(config.task_text)
     torch.manual_seed(config.seeds[0])
     baseline_action, _ = policy.get_action(observation, options={"rtc_mode": "off"})
     results: dict[str, Any] = {}
     for mode in config.modes:
         reason = _unsupported_reason(mode, checkpoint_config, config.prefix_steps)
+        if mode not in profile.supported_rtc_modes:
+            reason = "RTC mode is not supported by the serving profile"
         if reason is not None:
             results[mode] = {"status": "unsupported", "reason": reason}
             continue
@@ -201,237 +227,33 @@ def benchmark_checkpoint_latency(
     return results
 
 
-def _model_observation(data_point: Any, modality_configs: dict[str, Any]) -> dict[str, Any]:
-    observation: dict[str, Any] = {}
-    for key, value in data_point.states.items():
-        observation[f"state.{key}"] = value
-    for key, value in data_point.images.items():
-        observation[f"video.{key}"] = np.asarray(value)
-    for language_key in modality_configs["language"].modality_keys:
-        observation[language_key] = data_point.text
-    return parse_observation_gr00t(observation, modality_configs)
-
-
-def _action_row(action: dict[str, np.ndarray], index: int) -> dict[str, np.ndarray]:
-    return {key: value[0, index].copy() for key, value in action.items()}
-
-
-def _prefix_from_timeline(
-    timeline: dict[int, dict[str, np.ndarray]], source: int, count: int
-) -> dict[str, np.ndarray] | None:
-    rows = []
-    for target in range(source, source + count):
-        if target not in timeline:
-            return None
-        rows.append(timeline[target])
-    keys = rows[0]
-    return {key: np.stack([row[key] for row in rows], axis=0)[None, ...] for key in keys}
-
-
-def _flat_row(row: dict[str, np.ndarray], action_keys: list[str]) -> np.ndarray:
-    return np.concatenate([np.atleast_1d(row[key]) for key in action_keys])
-
-
-def _rotation_matrix_groot(value: np.ndarray) -> np.ndarray:
-    rows = np.asarray(value, dtype=np.float64).reshape(2, 3)
-    first = rows[0] / np.linalg.norm(rows[0])
-    second = rows[1] - np.dot(first, rows[1]) * first
-    second = second / np.linalg.norm(second)
-    return np.stack((first, second, np.cross(first, second)), axis=0)
-
-
-def _so3_error(left: np.ndarray, right: np.ndarray) -> float:
-    delta = _rotation_matrix_groot(left) @ _rotation_matrix_groot(right).T
-    return math.acos(float(np.clip((np.trace(delta) - 1.0) / 2.0, -1.0, 1.0)))
-
-
-def _chunk_dynamics(action: dict[str, np.ndarray]) -> tuple[float, float, float, float, float]:
-    position_step = 0.0
-    orientation_step = 0.0
-    gripper_step = 0.0
-    position_second = 0.0
-    gripper_second = 0.0
-    for side in ("left", "right"):
-        eef = action[f"{side}_eef"][0]
-        gripper = action[f"{side}_gripper"][0, :, 0]
-        position_step = max(
-            position_step,
-            float(np.linalg.norm(np.diff(eef[:, :3], axis=0), axis=1).max()),
-        )
-        orientation_step = max(
-            orientation_step,
-            max(_so3_error(eef[index, 3:], eef[index - 1, 3:]) for index in range(1, len(eef))),
-        )
-        gripper_step = max(gripper_step, float(np.abs(np.diff(gripper)).max()))
-        position_second = max(
-            position_second,
-            float(np.linalg.norm(np.diff(eef[:, :3], n=2, axis=0), axis=1).max()),
-        )
-        gripper_second = max(gripper_second, float(np.abs(np.diff(gripper, n=2)).max()))
-    return position_step, orientation_step, gripper_step, position_second, gripper_second
-
-
-def _prefix_errors(
-    action: dict[str, np.ndarray], prefix: dict[str, np.ndarray], steps: int
-) -> tuple[float, float, float]:
-    position_error = 0.0
-    orientation_error = 0.0
-    gripper_error = 0.0
-    for side in ("left", "right"):
-        actual_eef = action[f"{side}_eef"][0, :steps]
-        expected_eef = prefix[f"{side}_eef"][0, :steps]
-        position_error = max(
-            position_error,
-            float(np.linalg.norm(actual_eef[:, :3] - expected_eef[:, :3], axis=1).max()),
-        )
-        orientation_error = max(
-            orientation_error,
-            max(
-                _so3_error(actual_eef[index, 3:], expected_eef[index, 3:]) for index in range(steps)
-            ),
-        )
-        actual_gripper = action[f"{side}_gripper"][0, :steps]
-        expected_gripper = prefix[f"{side}_gripper"][0, :steps]
-        gripper_error = max(
-            gripper_error,
-            float(np.max(np.abs(actual_gripper - expected_gripper))),
-        )
-    return position_error, orientation_error, gripper_error
-
-
-def replay_trajectory(
-    policy: Gr00tPolicy,
-    loader: LeRobotEpisodeLoader,
-    trajectory_id: int,
-    embodiment: EmbodimentTag,
-    mode: str,
-    config: BenchmarkConfig,
-) -> dict[str, Any]:
-    trajectory = loader[trajectory_id]
-    observation_modalities = deepcopy(loader.modality_configs)
-    observation_modalities.pop("action")
-    action_keys = loader.modality_configs["action"].modality_keys
-    timeline: dict[int, dict[str, np.ndarray]] = {}
-    errors: list[np.ndarray] = []
-    position_seams: list[float] = []
-    orientation_seams: list[float] = []
-    gripper_seams: list[float] = []
-    dynamics: list[tuple[float, float, float, float, float]] = []
-    prefix_errors: list[tuple[float, float, float]] = []
-    covered_targets: set[int] = set()
-    holds = 0
-    rejections = 0
-    call_index = 0
-    source = 0
-    max_source = min(config.replay_steps, len(trajectory) - ACTION_HORIZON)
-    while source < max_source:
-        delay = config.delay_trace[call_index % len(config.delay_trace)]
-        if delay >= ACTION_HORIZON or source + delay >= len(trajectory):
-            break
-        step_data = extract_step_data(
-            trajectory,
-            source,
-            observation_modalities,
-            embodiment,
-        )
-        observation = _model_observation(step_data, loader.modality_configs)
-        effective_mode = "off" if call_index == 0 else mode
-        requested_prefix = config.native_overlap_steps if effective_mode == "native" else delay
-        prefix = None
-        if effective_mode != "off":
-            prefix = _prefix_from_timeline(timeline, source, requested_prefix)
-            if prefix is None:
-                holds += delay
-                source += delay
-                call_index += 1
-                continue
-        options = _mode_options(
-            effective_mode,
-            prefix,
-            prefix_steps=delay,
-            overlap_steps=config.native_overlap_steps,
-            ramp_rate=config.rtc_ramp_rate,
-        )
-        torch.manual_seed(config.seeds[call_index % len(config.seeds)])
-        action, _ = policy.get_action(observation, options=options)
-        dynamics.append(_chunk_dynamics(action))
-        if prefix is not None:
-            hard_steps = delay
-            prefix_error = _prefix_errors(action, prefix, hard_steps)
-            prefix_errors.append(prefix_error)
-            if (
-                prefix_error[0] > config.rtc_position_tolerance
-                or prefix_error[1] > config.rtc_orientation_tolerance_rad
-                or prefix_error[2] > config.rtc_gripper_tolerance
-            ):
-                rejections += 1
-                source += delay
-                call_index += 1
-                continue
-
-        first_target = source + delay
-        predicted = _action_row(action, delay)
-        ground_truth = {
-            key: np.asarray(trajectory[f"action.{key}"].iloc[first_target]) for key in action_keys
-        }
-        errors.append(_flat_row(predicted, action_keys) - _flat_row(ground_truth, action_keys))
-        previous = timeline.get(first_target)
-        if previous is not None:
-            for side in ("left_eef", "right_eef"):
-                position_seams.append(
-                    float(np.linalg.norm(predicted[side][:3] - previous[side][:3]))
-                )
-                orientation_seams.append(_so3_error(predicted[side][3:], previous[side][3:]))
-            for side in ("left_gripper", "right_gripper"):
-                gripper_seams.append(float(np.max(np.abs(predicted[side] - previous[side]))))
-
-        completion = source + delay - 1
-        timeline = {
-            source + index: _action_row(action, index)
-            for index in range(ACTION_HORIZON)
-            if source + index > completion
-        }
-        covered_targets.update(timeline)
-        source += delay
-        call_index += 1
-
-    if not errors:
-        return {
-            "status": "no_admitted_predictions",
-            "holds": holds,
-            "rejections": rejections,
-        }
-    error = np.stack(errors)
-    requested_targets = max(1, min(config.replay_steps, len(trajectory)))
-    covered_within_request = sum(0 <= target < requested_targets for target in covered_targets)
-    dynamics_array = np.asarray(dynamics)
-    prefix_error_array = np.asarray(prefix_errors) if prefix_errors else None
-    return {
-        "status": "ok",
-        "calls": call_index,
-        "first_executable_row_mse": float(np.mean(error**2)),
-        "first_executable_row_mae": float(np.mean(np.abs(error))),
-        "target_timestep_coverage": covered_within_request / requested_targets,
-        "hold_rate": holds / requested_targets,
-        "rejections": rejections,
-        "prefix_position_error_m": (
-            _summary(prefix_error_array[:, 0].tolist()) if prefix_error_array is not None else None
-        ),
-        "prefix_orientation_error_rad": (
-            _summary(prefix_error_array[:, 1].tolist()) if prefix_error_array is not None else None
-        ),
-        "prefix_gripper_error": (
-            _summary(prefix_error_array[:, 2].tolist()) if prefix_error_array is not None else None
-        ),
-        "position_seam": _summary(position_seams) if position_seams else None,
-        "orientation_seam_rad": _summary(orientation_seams) if orientation_seams else None,
-        "gripper_seam": _summary(gripper_seams) if gripper_seams else None,
-        "max_position_step_m": _summary(dynamics_array[:, 0].tolist()),
-        "max_orientation_step_rad": _summary(dynamics_array[:, 1].tolist()),
-        "max_gripper_step": _summary(dynamics_array[:, 2].tolist()),
-        "max_position_second_difference_m": _summary(dynamics_array[:, 3].tolist()),
-        "max_gripper_second_difference": _summary(dynamics_array[:, 4].tolist()),
-    }
+def replay_trajectory(policy, loader, trajectory_id, embodiment, mode, config):
+    profile = load_industrialnext_profile(config.profile_config)
+    profile.assert_policy_contract(policy)
+    serving = IndustrialNextServingConfig(
+        action_horizon=profile.action_horizon,
+        action_offset=config.action_offset,
+        ensemble_strategy=config.ensemble_strategy,
+        ensemble_coeff=config.ensemble_coeff,
+        max_ensemble_chunks=config.max_ensemble_chunks,
+        chunk_transition_frames=config.chunk_transition_frames,
+        min_usable_action_steps=config.min_usable_action_steps,
+        max_action_lateness_s=config.max_action_lateness_s,
+        max_control_clock_drift_s=config.max_control_clock_drift_s,
+        rtc_mode=mode,
+        rtc_initial_frozen_steps=config.prefix_steps,
+        rtc_max_prefix_steps=config.prefix_steps,
+        rtc_native_overlap_steps=config.native_overlap_steps,
+        rtc_min_new_tail_steps=config.min_new_tail_steps,
+        rtc_ramp_rate=config.rtc_ramp_rate,
+        rtc_position_tolerance=config.rtc_position_tolerance,
+        rtc_orientation_tolerance_rad=config.rtc_orientation_tolerance_rad,
+        rtc_gripper_tolerance=config.rtc_gripper_tolerance,
+        stats_log_interval_steps=0,
+    )
+    return asyncio.run(
+        replay_production(policy, loader, trajectory_id, embodiment, profile, serving, config)
+    )
 
 
 def benchmark_replay(
@@ -442,30 +264,72 @@ def benchmark_replay(
     if config.dataset_path is None:
         return None
     embodiment = EmbodimentTag.resolve(config.embodiment_tag)
-    loader = LeRobotEpisodeLoader(
-        dataset_path=config.dataset_path,
-        modality_configs=policy.get_modality_config(),
+    root = Path(config.dataset_path).expanduser().resolve()
+    paths = (
+        [root]
+        if (root / "meta/info.json").is_file()
+        else sorted(p.parent.parent for p in root.glob("*_val/meta/info.json"))
     )
+    if not paths:
+        raise ValueError("dataset_path must contain LeRobot metadata or explicit *_val datasets")
     results: dict[str, Any] = {}
+    profile = load_industrialnext_profile(config.profile_config)
+    recipes = [("configured", config)]
+    if config.run_ablations:
+        recipes = [
+            (
+                name,
+                replace(
+                    config,
+                    action_offset=offset,
+                    ensemble_strategy=strategy,
+                    chunk_transition_frames=frames,
+                ),
+            )
+            for name, offset, strategy, frames in (
+                ("control", 0, "latest_only", 0),
+                ("offset_only", 2, "latest_only", 0),
+                ("ensemble_only", 0, "temporal_exponential", 0),
+                ("transition_only", 0, "latest_only", 4),
+                ("postprocessing_offset0", 0, "temporal_exponential", 4),
+                ("default_offset2", 2, "temporal_exponential", 4),
+            )
+        ]
     for mode in config.modes:
-        reason = _unsupported_reason(mode, checkpoint_config, max(config.delay_trace))
+        reason = _unsupported_reason(mode, checkpoint_config, config.prefix_steps)
+        if mode not in profile.supported_rtc_modes:
+            reason = "RTC mode is not supported by the serving profile"
         if reason is not None:
             results[mode] = {"status": "unsupported", "reason": reason}
             continue
-        mode_results = {}
-        for trajectory_id in config.trajectory_ids:
-            if not 0 <= trajectory_id < len(loader):
-                mode_results[str(trajectory_id)] = {"status": "trajectory_out_of_range"}
-                continue
-            mode_results[str(trajectory_id)] = replay_trajectory(
-                policy,
-                loader,
-                trajectory_id,
-                embodiment,
-                mode,
-                config,
+        for dataset_path in paths:
+            loader = LeRobotEpisodeLoader(
+                dataset_path=str(dataset_path), modality_configs=policy.get_modality_config()
             )
-        results[mode] = {"status": "ok", "trajectories": mode_results}
+            for name, recipe in recipes if mode == "off" else [("configured", config)]:
+                trajectories = {}
+                ids = range(len(loader)) if config.trajectory_ids is None else config.trajectory_ids
+                for trajectory_id in ids:
+                    if not 0 <= trajectory_id < len(loader):
+                        raise ValueError(f"trajectory index out of range: {trajectory_id}")
+                    trajectories[str(trajectory_id)] = replay_trajectory(
+                        policy, loader, trajectory_id, embodiment, mode, recipe
+                    )
+                results[f"{mode}/{name}/{dataset_path.name}"] = {
+                    "status": "ok",
+                    "trajectories": trajectories,
+                    "dataset_path": str(dataset_path),
+                    "dataset_info_sha256": hashlib.sha256(
+                        (dataset_path / "meta/info.json").read_bytes()
+                    ).hexdigest(),
+                    "recipe": {
+                        "action_offset": recipe.action_offset,
+                        "ensemble_strategy": recipe.ensemble_strategy,
+                        "ensemble_coeff": recipe.ensemble_coeff,
+                        "max_ensemble_chunks": recipe.max_ensemble_chunks,
+                        "chunk_transition_frames": recipe.chunk_transition_frames,
+                    },
+                }
     return results
 
 
@@ -494,37 +358,50 @@ def _text_summary(report: dict[str, Any]) -> str:
                 if trajectory["status"] != "ok":
                     lines.append(f"{mode}/trajectory-{trajectory_id}: {trajectory['status']}")
                     continue
-                position_seam = trajectory["position_seam"]
-                orientation_seam = trajectory["orientation_seam_rad"]
-                gripper_seam = trajectory["gripper_seam"]
                 lines.append(
-                    f"{mode}/trajectory-{trajectory_id}: "
-                    f"mse={trajectory['first_executable_row_mse']:.6g} "
-                    f"mae={trajectory['first_executable_row_mae']:.6g} "
-                    f"coverage={trajectory['target_timestep_coverage']:.4f} "
-                    f"hold={trajectory['hold_rate']:.4f} "
-                    f"rejections={trajectory['rejections']} "
-                    f"prefix_position_max="
-                    f"{trajectory['prefix_position_error_m']['max'] if trajectory['prefix_position_error_m'] else float('nan'):.6g} "
-                    f"prefix_orientation_max="
-                    f"{trajectory['prefix_orientation_error_rad']['max'] if trajectory['prefix_orientation_error_rad'] else float('nan'):.6g} "
-                    f"prefix_gripper_max="
-                    f"{trajectory['prefix_gripper_error']['max'] if trajectory['prefix_gripper_error'] else float('nan'):.6g} "
-                    f"seam_position_p99="
-                    f"{position_seam['p99'] if position_seam else float('nan'):.6g} "
-                    f"seam_orientation_p99="
-                    f"{orientation_seam['p99'] if orientation_seam else float('nan'):.6g} "
-                    f"seam_gripper_p99="
-                    f"{gripper_seam['p99'] if gripper_seam else float('nan'):.6g} "
-                    f"step_position_max={trajectory['max_position_step_m']['max']:.6g} "
-                    f"step_orientation_max={trajectory['max_orientation_step_rad']['max']:.6g} "
-                    f"step_gripper_max={trajectory['max_gripper_step']['max']:.6g} "
-                    f"second_position_max="
-                    f"{trajectory['max_position_second_difference_m']['max']:.6g} "
-                    f"second_gripper_max="
-                    f"{trajectory['max_gripper_second_difference']['max']:.6g}"
+                    f"{mode}/trajectory-{trajectory_id}: coverage={trajectory['coverage']:.4f} "
+                    f"null_rate={trajectory['null_rate']:.4f} "
+                    f"physical_errors={trajectory['physical_errors']}"
                 )
     return "\n".join(lines) + "\n"
+
+
+def _validation_identity(config: BenchmarkConfig, model_path: Path) -> dict[str, Any]:
+    """Bind small configuration/source files once, outside the request path."""
+    root = Path(__file__).resolve().parents[2]
+    files = [Path(config.profile_config).expanduser().resolve(), model_path / "config.json"]
+    files.extend(model_path.glob("*processor*.json"))
+    files.extend(model_path.glob("*stat*.json"))
+    files.extend(
+        root / path
+        for path in (
+            "gr00t/policy/industrialnext/async_server.py",
+            "gr00t/policy/industrialnext/execution.py",
+            "gr00t/policy/industrialnext/profile_config.py",
+            "gr00t/policy/industrialnext/adapter.py",
+            "gr00t/policy/gr00t_policy.py",
+            "gr00t/eval/industrialnext_replay.py",
+            "gr00t/eval/benchmark_industrialnext_rtc.py",
+        )
+    )
+    return {
+        "source_commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True
+        ).strip(),
+        "source_dirty": bool(
+            subprocess.check_output(["git", "status", "--porcelain"], cwd=root, text=True)
+        ),
+        "files_sha256": {
+            str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in files
+            if path.is_file()
+        },
+        "hostname": platform.node(),
+        "python": platform.python_version(),
+        "torch": str(torch.__version__),
+        "device": config.device,
+        "weights_hashed": False,
+    }
 
 
 def main(config: BenchmarkConfig) -> None:
@@ -540,7 +417,8 @@ def main(config: BenchmarkConfig) -> None:
         strict=True,
     )
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "validation_identity": _validation_identity(config, model_path),
         "model_path": str(model_path),
         "provenance": build_service_provenance(model_path),
         "checkpoint_rtc_training_max_prefix_steps": checkpoint_config.get(

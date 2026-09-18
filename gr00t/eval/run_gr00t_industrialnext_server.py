@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import partial
 import ipaddress
 import json
@@ -45,6 +45,13 @@ class ServerConfig:
     port: int | None = None
     control_hz: float | None = None
     rtc_mode: str | None = None
+    action_offset: int | None = None
+    ensemble_strategy: str | None = None
+    ensemble_coeff: float | None = None
+    max_ensemble_chunks: int | None = None
+    chunk_transition_frames: int | None = None
+    max_action_lateness_s: float = 0.04
+    max_control_clock_drift_s: float = 0.1
     max_image_staleness_steps: int = 5
     min_usable_action_steps: int = 1
     idle_session_timeout_s: float = 300.0
@@ -99,6 +106,23 @@ def resolve_server_config(
     serving = IndustrialNextServingConfig(
         control_hz=profile.control_hz if config.control_hz is None else config.control_hz,
         action_horizon=profile.action_horizon,
+        action_offset=profile.action_offset
+        if config.action_offset is None
+        else config.action_offset,
+        ensemble_strategy=profile.ensemble_strategy
+        if config.ensemble_strategy is None
+        else config.ensemble_strategy,
+        ensemble_coeff=profile.ensemble_coeff
+        if config.ensemble_coeff is None
+        else config.ensemble_coeff,
+        max_ensemble_chunks=profile.max_ensemble_chunks
+        if config.max_ensemble_chunks is None
+        else config.max_ensemble_chunks,
+        chunk_transition_frames=profile.chunk_transition_frames
+        if config.chunk_transition_frames is None
+        else config.chunk_transition_frames,
+        max_action_lateness_s=config.max_action_lateness_s,
+        max_control_clock_drift_s=config.max_control_clock_drift_s,
         max_image_staleness_steps=config.max_image_staleness_steps,
         min_usable_action_steps=config.min_usable_action_steps,
         idle_session_timeout_s=config.idle_session_timeout_s,
@@ -183,6 +207,7 @@ async def serve_forever(
     handler: IndustrialNextAsyncServer | None = None
     loop = asyncio.get_running_loop()
     try:
+        logger.info("Resolved serving settings: %s", json.dumps(asdict(config.serving)))
         logger.info("Loading strict GR00T policy from %s on %s", config.model_path, config.device)
         policy = await loop.run_in_executor(
             executor,

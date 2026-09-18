@@ -33,6 +33,7 @@ from industrialnext_rpc.direct.client import DirectClient
 from industrialnext_rpc.direct.server import DirectServer
 import numpy as np
 import pytest
+import yaml
 
 
 TASK_UUID = "generic_pick"
@@ -258,13 +259,9 @@ def test_config_only_cli_defaults_and_overrides(tmp_path: Path) -> None:
     model_path.mkdir()
     config_path = tmp_path / "semihumanoid.yaml"
     source = Path("configs/embodiments/semihumanoid.yaml").read_text(encoding="utf-8")
-    config_path.write_text(
-        source.replace(
-            "~/ml_data/outputs/gr00t/semihumanoid_20260820_202230/checkpoint-6321",
-            str(model_path),
-        ),
-        encoding="utf-8",
-    )
+    document = yaml.safe_load(source)
+    document["serving"]["model_path"] = str(model_path)
+    config_path.write_text(yaml.safe_dump(document), encoding="utf-8")
 
     resolved, profile = resolve_server_config(ServerConfig(config=str(config_path), port=0))
     assert resolved.model_path == model_path.resolve()
@@ -282,6 +279,8 @@ def test_config_only_cli_defaults_and_overrides(tmp_path: Path) -> None:
     native = ServerConfig(
         config=str(config_path),
         rtc_mode="native",
+        ensemble_strategy="latest_only",
+        chunk_transition_frames=0,
     )
     assert resolve_server_config(native)[0].serving.rtc_mode == "native"
     with pytest.raises(ValueError, match="does not advertise"):
@@ -289,6 +288,8 @@ def test_config_only_cli_defaults_and_overrides(tmp_path: Path) -> None:
             ServerConfig(
                 config=str(config_path),
                 rtc_mode="trained_prefix",
+                ensemble_strategy="latest_only",
+                chunk_transition_frames=0,
             )
         )
     (model_path / "config.json").write_text(
@@ -304,6 +305,8 @@ def test_config_only_cli_defaults_and_overrides(tmp_path: Path) -> None:
     trained = ServerConfig(
         config=str(config_path),
         rtc_mode="trained_prefix",
+        ensemble_strategy="latest_only",
+        chunk_transition_frames=0,
         rtc_max_prefix_steps=4,
     )
     assert resolve_server_config(trained)[0].serving.rtc_max_prefix_steps == 4
@@ -313,3 +316,51 @@ def test_config_only_cli_defaults_and_overrides(tmp_path: Path) -> None:
         "checkpoint_action_horizon": 40,
         "checkpoint_rtc_training_max_prefix_steps": 4,
     }
+
+
+def test_serving_recipe_precedence_and_absolute_metadata(tmp_path):
+    document = yaml.safe_load(Path("configs/embodiments/taro_exp_100.yaml").read_text())
+    document["serving"].update(
+        model_path=str(tmp_path),
+        action_offset=1,
+        ensemble_coeff=0.2,
+        max_ensemble_chunks=2,
+        chunk_transition_frames=3,
+    )
+    path = tmp_path / "profile.yaml"
+    path.write_text(yaml.safe_dump(document))
+    resolved, profile = resolve_server_config(
+        ServerConfig(config=str(path), action_offset=2, ensemble_coeff=0.3)
+    )
+    assert resolved.serving.action_offset == 2
+    assert profile.action_start_offset_steps == 0
+    assert resolved.serving.ensemble_coeff == 0.3
+    assert resolved.serving.max_ensemble_chunks == 2
+    assert resolved.serving.chunk_transition_frames == 3
+    metadata = profile.service_metadata()
+    assert metadata["state_dim"] == 38
+    assert metadata["action_dim"] == 29
+    assert metadata["internal_action_fields"] == metadata["action_fields"]
+    assert {field["representation"] for field in metadata["action_fields"]} == {"absolute"}
+    assert metadata["action_fields"][-1]["length"] == 20
+    with pytest.raises(ValueError, match="RTC requires"):
+        IndustrialNextServingConfig(rtc_mode="native")
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"action_offset": True},
+        {"action_offset": -1},
+        {"action_offset": 40},
+        {"ensemble_coeff": float("nan")},
+        {"ensemble_coeff": True},
+        {"chunk_transition_frames": True},
+        {"max_ensemble_chunks": 0},
+        {"max_action_lateness_s": 0},
+        {"max_control_clock_drift_s": float("inf")},
+    ],
+)
+def test_invalid_serving_recipe_fails_before_model_loading(settings):
+    with pytest.raises(ValueError):
+        IndustrialNextServingConfig(**settings)

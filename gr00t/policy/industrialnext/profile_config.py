@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from pathlib import Path
+import time
 from types import MappingProxyType
 from typing import Any, Mapping, MutableMapping, Protocol
 
@@ -75,6 +76,11 @@ class ConfigDrivenIndustrialNextProfile:
     gripper_action_keys: tuple[str, ...]
     task_catalog: TaskCatalog
     neck_joint_names: tuple[str, ...] = ()
+    action_offset: int = 0
+    ensemble_strategy: str = "temporal_exponential"
+    ensemble_coeff: float = 0.1
+    max_ensemble_chunks: int = 3
+    chunk_transition_frames: int = 4
 
     @property
     def state_fields(self) -> tuple[str, ...]:
@@ -152,9 +158,11 @@ class ConfigDrivenIndustrialNextProfile:
         task_text: str,
         generation: int,
         max_image_staleness_steps: int,
+        now_s: float | None = None,
     ) -> ObservationAdmission:
         if not isinstance(observation, Mapping):
             raise ValueError("observation must be a mapping")
+        now_s = time.monotonic() if now_s is None else now_s
         state = {
             field: _finite_tuple(observation.get(field), self.field_lengths[field], field)
             for field in self.state_fields
@@ -188,6 +196,7 @@ class ConfigDrivenIndustrialNextProfile:
                     metadata, name, self.image_width, self.image_height
                 ),
                 updated_timestep=timestep,
+                received_at_s=now_s,
             )
         for name in raw_metadata:
             if name not in updates and name not in self.ignored_observation_keys:
@@ -201,7 +210,12 @@ class ConfigDrivenIndustrialNextProfile:
         stale = tuple(
             name
             for name, age in ages.items()
-            if age is not None and age > max_image_staleness_steps
+            if age is not None
+            and (
+                age > max_image_staleness_steps
+                or now_s - image_cache[name].received_at_s
+                > max(1, max_image_staleness_steps) / self.control_hz
+            )
         )
         snapshot = None
         if not missing and not stale:
@@ -212,6 +226,7 @@ class ConfigDrivenIndustrialNextProfile:
                 task_text=task_text,
                 source_timestep=timestep,
                 generation=generation,
+                received_at_s=now_s,
             )
         return ObservationAdmission(
             snapshot=snapshot,
@@ -308,8 +323,46 @@ class ConfigDrivenIndustrialNextProfile:
             output[layout.key] = np.stack(assembled)[None, ...]
         return output
 
+    def _field_metadata(self, layouts: tuple[ProfileLayout, ...]) -> list[dict[str, Any]]:
+        fields = []
+        offset = 0
+        for layout in layouts:
+            for index, (name, width) in enumerate(zip(layout.fields, layout.widths)):
+                rotation = index == layout.rot6d_index
+                role = (
+                    "rotation"
+                    if rotation
+                    else "position"
+                    if name.endswith("_pose_pos")
+                    else "scalar"
+                )
+                fields.append(
+                    {
+                        "name": name,
+                        "length": width,
+                        "slice": [offset, offset + width],
+                        "role": role,
+                        "group": layout.key,
+                        "rotation_mode": "rot6d" if rotation else None,
+                        "rotation_convention": "columns" if rotation else None,
+                        "units": self.field_units[name],
+                        "frame": self.eef_frame if rotation or role == "position" else None,
+                        "representation": "absolute",
+                    }
+                )
+                offset += width
+        return fields
+
     def service_metadata(self) -> dict[str, Any]:
         return {
+            "state_fields": self._field_metadata(self.state_layouts),
+            "action_fields": self._field_metadata(self.action_layouts),
+            "internal_action_fields": self._field_metadata(self.action_layouts),
+            "state_dim": sum(layout.width for layout in self.state_layouts),
+            "action_dim": sum(layout.width for layout in self.action_layouts),
+            "internal_action_dim": sum(layout.width for layout in self.action_layouts),
+            "action_fields_scope": "model_predicted_fields",
+            "vision_modalities": ["rgb"],
             "profile": self.profile_name,
             "expert_camera_height": self.image_height,
             "expert_camera_width": self.image_width,
@@ -366,6 +419,11 @@ def load_industrialnext_profile(path: str | Path) -> ConfigDrivenIndustrialNextP
     serving = _mapping(raw.get("serving"), "serving")
     serving_keys = {
         "cameras",
+        "action_offset",
+        "ensemble_strategy",
+        "ensemble_coeff",
+        "max_ensemble_chunks",
+        "chunk_transition_frames",
         "profile",
         "embodiment_tag",
         "model_path",
@@ -515,6 +573,11 @@ def load_industrialnext_profile(path: str | Path) -> ConfigDrivenIndustrialNextP
 
     return ConfigDrivenIndustrialNextProfile(
         neck_joint_names=neck_joint_names,
+        action_offset=serving.get("action_offset", 0),
+        ensemble_strategy=serving.get("ensemble_strategy", "temporal_exponential"),
+        ensemble_coeff=serving.get("ensemble_coeff", 0.1),
+        max_ensemble_chunks=serving.get("max_ensemble_chunks", 3),
+        chunk_transition_frames=serving.get("chunk_transition_frames", 4),
         name=_string(raw.get("name"), "name"),
         profile_name=_string(serving.get("profile"), "serving.profile"),
         config_path=config_path,

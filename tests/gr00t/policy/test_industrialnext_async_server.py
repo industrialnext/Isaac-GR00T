@@ -79,6 +79,12 @@ def _server(
     idle_session_timeout_s: float = 300.0,
     **config_overrides: Any,
 ) -> IndustrialNextAsyncServer:
+    config_overrides.setdefault("ensemble_strategy", "latest_only")
+    config_overrides.setdefault("chunk_transition_frames", 0)
+    # Legacy worker/lifecycle tests advance ticks without pacing. Timing laws
+    # are covered below with a deterministic clock and production tolerances.
+    config_overrides.setdefault("max_control_clock_drift_s", 10.0)
+    config_overrides.setdefault("max_action_lateness_s", 10.0)
     return IndustrialNextAsyncServer(
         policy=policy,
         executor=ThreadPoolExecutor(max_workers=1, thread_name_prefix="groot-test"),
@@ -213,7 +219,12 @@ def test_metadata_and_configuration_contract() -> None:
         IndustrialNextServingConfig(min_usable_action_steps=0)
     assert IndustrialNextServingConfig(action_horizon=8, rtc_mode="off").action_horizon == 8
     with pytest.raises(ValueError, match="must leave"):
-        IndustrialNextServingConfig(action_horizon=8, rtc_mode="native")
+        IndustrialNextServingConfig(
+            action_horizon=8,
+            rtc_mode="native",
+            ensemble_strategy="latest_only",
+            chunk_transition_frames=0,
+        )
 
 
 def test_protocol_metadata_cannot_be_overridden_by_provenance() -> None:
@@ -366,10 +377,9 @@ def test_inference_failure_and_minimum_tail_are_fail_closed() -> None:
             await _wait_until(lambda: server._inference_future is None)
             response = _step(server, session_id)
             assert response["action"] is None
-            assert response["inference_status"] == "reregistration_required"
-            assert response["monitoring"]["null_reason"] == "reregistration_required"
-            assert response["monitoring"]["requires_reregistration"] is True
-            assert "synthetic inference failure" in response["monitoring"]["latest_inference_error"]
+            assert response["error"] == "session_unusable"
+            assert "synthetic inference failure" in response["reason"]
+            assert _step(server, session_id)["error"] == "session_unusable"
             replacement = _register(server)
             assert replacement != session_id
         finally:
@@ -386,7 +396,7 @@ def test_inference_failure_and_minimum_tail_are_fail_closed() -> None:
             await _wait_until(lambda: server._inference_future is None)
             assert server._active_session is not None
             assert server._active_session.timeline == {}
-            assert server._active_session.inference_status == "insufficient_tail"
+            assert server._active_session.terminal_reason.startswith("insufficient_usable_tail")
             assert server._active_session.stats.rejected_tails == 1
         finally:
             policy.release.set()
@@ -570,8 +580,8 @@ def test_rtc_delay_prediction_above_runtime_bound_fails_closed(rtc_mode: str) ->
 
             server._active_session.timeline.clear()
             exhausted = _step(server, session_id)
-            assert exhausted["monitoring"]["requires_reregistration"] is True
-            assert exhausted["monitoring"]["null_reason"] == "reregistration_required"
+            assert exhausted["error"] == "session_unusable"
+            assert "required prefix 5" in exhausted["reason"]
         finally:
             await server.shutdown()
 
@@ -617,7 +627,7 @@ def test_action_dynamics_limit_rejects_without_clipping_output() -> None:
             await _wait_until(lambda: server._inference_future is None)
             assert server._active_session is not None
             assert server._active_session.timeline == {}
-            assert server._active_session.inference_status == "action_dynamics_limit"
+            assert server._active_session.terminal_reason.startswith("action_dynamics_limit")
             assert server._active_session.stats.rejected_dynamics == 1
             assert server._active_session.requires_reregistration is True
         finally:
@@ -713,3 +723,213 @@ def test_xarm_profile_schedules_model_row_zero_at_observation_offset_one() -> No
             await server.shutdown()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("offset,target_offset,first_row", [(2, 0, 7), (0, 0, 5), (2, 1, 6)])
+def test_execution_offset_maps_original_rows_with_virtual_clock(offset, target_offset, first_row):
+    from gr00t.policy.industrialnext.adapter import ObservationSnapshot
+    from gr00t.policy.industrialnext.async_server import InferenceRequest, InferenceResult
+
+    async def scenario():
+        server = _server(_FakePolicy(), action_offset=offset)
+        now = [100.0]
+        server.clock = lambda: now[0]
+        server.profile = replace(server.profile, action_start_offset_steps=target_offset)
+        try:
+            session_id = _register(server)
+            for tick in range(5):
+                now[0] = 100 + tick / 50
+                _step(server, session_id)
+            snapshot = ObservationSnapshot(
+                {}, {}, TASK_UUID, TASK_TEXT, 0, server._active_session.generation, 100.0
+            )
+            rows = server.profile.map_action_chunk(_decoded_action())
+            result = InferenceResult(InferenceRequest(snapshot, "off"), rows, 80, 0, {})
+            server._admit_inference_result(server._active_session, result)
+            now[0] = 100.1
+            response = _step(server, session_id)
+            assert response["action"]["left_arm_pose_pos"][0] == first_row
+            assert (
+                response["monitoring"]["emitted_action"]["contributions"][0]["model_row"]
+                == first_row
+            )
+        finally:
+            await server.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_actual_command_jump_terminates_and_late_result_cannot_revive():
+    from gr00t.policy.industrialnext.adapter import ObservationSnapshot
+    from gr00t.policy.industrialnext.async_server import InferenceRequest, InferenceResult
+
+    async def scenario():
+        server = _server(_FakePolicy(), max_position_step_m=0.01)
+        server.clock = lambda: 100.0
+        try:
+            session_id = _register(server)
+            _step(server, session_id)
+            session = server._active_session
+            base = server.profile.map_action_chunk(_decoded_action())[0]
+            session.served_history[0] = base
+            changed = {key: list(value) for key, value in base.items()}
+            changed["left_arm_pose_pos"] = [1, 0, 0]
+            snapshot = ObservationSnapshot({}, {}, TASK_UUID, TASK_TEXT, 0, session.generation, 100)
+            result = InferenceResult(InferenceRequest(snapshot, "off"), (changed,) * 40, 0, 0, {})
+            server._admit_inference_result(session, result)
+            response = _step(server, session_id)
+            assert response["error"] == "session_unusable"
+            assert "emitted_action_dynamics_limit" in response["reason"]
+            assert response["action"] is None
+            server._admit_inference_result(session, result)
+            assert not session.timeline
+            assert list(session.served_history) == [0]
+        finally:
+            await server.shutdown()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_failed_refresh_only_preserves_unexpired_predictions(expired):
+    from gr00t.policy.industrialnext.adapter import ObservationSnapshot
+    from gr00t.policy.industrialnext.async_server import InferenceRequest
+    from gr00t.policy.industrialnext.execution import Contribution, ExecutionSlot, freeze_action
+
+    async def scenario():
+        server = _server(_FakePolicy())
+        server.clock = lambda: 100.0
+        try:
+            _register(server)
+            session = server._active_session
+            row = server.profile.map_action_chunk(_decoded_action())[0]
+            session.timeline[1] = ExecutionSlot(
+                (
+                    Contribution(
+                        freeze_action(row),
+                        0,
+                        1,
+                        99.0,
+                        99.5 if expired else 100.5,
+                    ),
+                )
+            )
+            snapshot = ObservationSnapshot({}, {}, TASK_UUID, TASK_TEXT, 0, session.generation, 99)
+            future = asyncio.get_running_loop().create_future()
+            future.set_exception(RuntimeError("refresh failed"))
+            server._inference_future = future
+            server._complete_inference(InferenceRequest(snapshot, "off"), future)
+            assert session.requires_reregistration is expired
+            assert bool(session.timeline) is not expired
+            if expired:
+                assert server._terminal_response(session)["error"] == "session_unusable"
+        finally:
+            await server.shutdown()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "strategy,frames",
+    [("temporal_exponential", 0), ("latest_only", 4), ("temporal_exponential", 4)],
+)
+def test_ensemble_and_transition_are_independent_and_expire(strategy, frames):
+    from gr00t.policy.industrialnext.adapter import ObservationSnapshot
+    from gr00t.policy.industrialnext.async_server import InferenceRequest, InferenceResult
+
+    async def scenario():
+        server = _server(
+            _FakePolicy(),
+            ensemble_strategy=strategy,
+            chunk_transition_frames=frames,
+            ensemble_coeff=0.2,
+            max_ensemble_chunks=2,
+            max_action_lateness_s=0.04,
+        )
+        now = [100.0]
+        server.clock = lambda: now[0]
+        try:
+            session_id = _register(server)
+            _step(server, session_id)
+            session = server._active_session
+            base = server.profile.map_action_chunk(_decoded_action())[0]
+
+            def result(source, value, received):
+                row = {name: list(v) for name, v in base.items()}
+                row["left_gripper"] = [value]
+                snapshot = ObservationSnapshot(
+                    {}, {}, TASK_UUID, TASK_TEXT, source, session.generation, received
+                )
+                return InferenceResult(InferenceRequest(snapshot, "off"), (row,) * 40, 0, 0, {})
+
+            server._admit_inference_result(session, result(0, 0, 100))
+            now[0] = 100.02
+            session.timestep = 1
+            server._admit_inference_result(session, result(1, 1, 100.02))
+            slot = session.timeline[2]
+            value = server._resolve_slot(slot)[0]["left_gripper"][0]
+            blended = 1.0 if strategy == "latest_only" else 1 / (1 + np.exp(-0.2))
+            assert value == pytest.approx(blended * (0.15625 if frames else 1))
+            # A refresh halfway through the transition anchors to the already planned command.
+            session.timestep = 1
+            now[0] = 100.025
+            server._admit_inference_result(session, result(2, 0.5, 100.025))
+            assert len(session.timeline[2].contributions) <= 2
+            if frames:
+                assert session.timeline[2].anchor.action["left_gripper"][0] == pytest.approx(value)
+                assert session.timeline[2].anchor.deadline_s <= slot.anchor.deadline_s
+            server._expire_timeline(session, 105, 2)
+            assert not session.timeline
+        finally:
+            await server.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_clock_drift_and_command_gap_fail_closed_without_restarting():
+    async def scenario():
+        for reason in ("control_clock_drift", "command_gap_expired"):
+            server = _server(
+                _FakePolicy(), max_action_lateness_s=0.04, max_control_clock_drift_s=0.1
+            )
+            now = [100.0]
+            server.clock = lambda: now[0]
+            try:
+                session_id = _register(server)
+                _step(server, session_id)
+                if reason == "command_gap_expired":
+                    server._active_session.last_emitted_at_s = 100
+                    now[0] = 100.081
+                else:
+                    now[0] = 105
+                response = _step(server, session_id)
+                assert response["error"] == "session_unusable"
+                assert reason in response["reason"]
+                assert _step(server, session_id)["error"] == "session_unusable"
+            finally:
+                await server.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_rotation_mean_and_transition_use_so3_not_six_coordinate_averaging():
+    from gr00t.policy.industrialnext.execution import (
+        blend_actions,
+        interpolate_actions,
+        rotation_matrix,
+    )
+    from scipy.spatial.transform import Rotation
+
+    def row(degrees):
+        matrix = Rotation.from_euler("z", degrees, degrees=True).as_matrix()
+        return {"rot": tuple(matrix[:, :2].T.reshape(-1)), "hand": (0.2,) * 20}
+
+    left, right = row(170), row(-170)
+    mean = blend_actions([left, right], np.array([0.5, 0.5]), ("rot",))
+    transition = interpolate_actions(left, right, 0.5, ("rot",))
+    expected = Rotation.from_euler("z", 180, degrees=True).as_matrix()
+    np.testing.assert_allclose(rotation_matrix(mean["rot"]), expected, atol=1e-7)
+    np.testing.assert_allclose(rotation_matrix(transition["rot"]), expected, atol=1e-7)
+    assert mean["hand"] == [0.2] * 20
+    with pytest.raises(ValueError, match="ill-conditioned"):
+        blend_actions([row(0), row(180)], np.array([0.5, 0.5]), ("rot",))

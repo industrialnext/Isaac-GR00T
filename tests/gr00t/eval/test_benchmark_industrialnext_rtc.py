@@ -6,11 +6,12 @@
 from gr00t.eval.benchmark_industrialnext_rtc import (
     BenchmarkConfig,
     _mode_options,
-    _prefix_errors,
     _summary,
     _text_summary,
     _unsupported_reason,
 )
+from gr00t.policy.industrialnext.async_server import _prefix_errors
+from gr00t.policy.industrialnext.profile_config import load_industrialnext_profile
 import numpy as np
 import pytest
 
@@ -38,14 +39,17 @@ def test_prefix_errors_compare_physical_pose_and_gripper_contract() -> None:
     action = {}
     for side in ("left", "right"):
         action[f"{side}_eef"] = np.concatenate(
-            (np.zeros((1, 2, 3)), np.tile(identity, (1, 2, 1))), axis=-1
+            (np.zeros((1, 40, 3)), np.tile(identity, (1, 40, 1))), axis=-1
         )
-        action[f"{side}_gripper"] = np.zeros((1, 2, 1))
+        action[f"{side}_gripper"] = np.zeros((1, 40, 1))
     prefix = {key: value.copy() for key, value in action.items()}
     action["left_eef"][0, 1, 0] = 0.01
     action["right_gripper"][0, 0, 0] = 0.02
 
-    position, orientation, gripper = _prefix_errors(action, prefix, 2)
+    profile = load_industrialnext_profile("configs/embodiments/semihumanoid.yaml")
+    position, orientation, gripper = _prefix_errors(
+        profile.map_action_chunk(prefix), profile.map_action_chunk(action), 2, profile
+    )
 
     assert position == pytest.approx(0.01)
     assert orientation == pytest.approx(0.0)
@@ -69,26 +73,51 @@ def test_latency_summary_and_bounds_are_deterministic() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "override", [{"control_hz": 25}, {"delay_trace": [1.5]}, {"replay_steps": 0}]
+)
+def test_replay_rejects_unrepresentable_timing(override):
+    with pytest.raises(ValueError):
+        BenchmarkConfig(model_path="checkpoint", output_dir="report", **override)
+
+
+def test_replay_passes_nondefault_rtc_controls_to_production(monkeypatch):
+    from types import SimpleNamespace
+
+    from gr00t.eval import benchmark_industrialnext_rtc as benchmark
+
+    profile = SimpleNamespace(action_horizon=40, assert_policy_contract=lambda policy: None)
+    monkeypatch.setattr(benchmark, "load_industrialnext_profile", lambda path: profile)
+
+    async def capture(policy, loader, trajectory_id, embodiment, profile, serving, config):
+        return serving
+
+    monkeypatch.setattr(benchmark, "replay_production", capture)
+    config = BenchmarkConfig(
+        model_path="checkpoint",
+        output_dir="report",
+        action_offset=0,
+        ensemble_strategy="latest_only",
+        chunk_transition_frames=0,
+        rtc_ramp_rate=2.5,
+        rtc_position_tolerance=0.002,
+        rtc_orientation_tolerance_rad=0.003,
+        rtc_gripper_tolerance=0.004,
+    )
+    serving = benchmark.replay_trajectory(None, None, 0, None, "native", config)
+    assert serving.rtc_ramp_rate == 2.5
+    assert serving.rtc_position_tolerance == 0.002
+    assert serving.rtc_orientation_tolerance_rad == 0.003
+    assert serving.rtc_gripper_tolerance == 0.004
+
+
 def test_text_summary_includes_replay_metrics() -> None:
     scalar = {"mean": 1.0, "p50": 1.0, "p95": 1.0, "p99": 1.0, "max": 1.0}
     trajectory = {
         "status": "ok",
-        "first_executable_row_mse": 0.1,
-        "first_executable_row_mae": 0.2,
-        "target_timestep_coverage": 0.9,
-        "hold_rate": 0.1,
-        "rejections": 0,
-        "prefix_position_error_m": scalar,
-        "prefix_orientation_error_rad": scalar,
-        "prefix_gripper_error": scalar,
-        "position_seam": scalar,
-        "orientation_seam_rad": scalar,
-        "gripper_seam": scalar,
-        "max_position_step_m": scalar,
-        "max_orientation_step_rad": scalar,
-        "max_gripper_step": scalar,
-        "max_position_second_difference_m": scalar,
-        "max_gripper_second_difference": scalar,
+        "coverage": 0.9,
+        "null_rate": 0.1,
+        "physical_errors": {"same_time": {"position_m": {"mean": 0.1}}},
     }
     report = {
         "model_path": "checkpoint",
@@ -108,7 +137,8 @@ def test_text_summary_includes_replay_metrics() -> None:
     summary = _text_summary(report)
 
     assert "held-out replay:" in summary
-    assert "off/trajectory-0: mse=0.1" in summary
+    assert "off/trajectory-0: coverage=0.9000 null_rate=0.1000" in summary
+    assert "physical_errors=" in summary
     assert "trained_prefix: unsupported (old checkpoint)" in summary
 
 
@@ -128,3 +158,76 @@ def test_text_summary_allows_replay_only_report() -> None:
 
     assert "held-out replay:" in summary
     assert "off/trajectory-0: no_admitted_predictions" in summary
+
+
+def test_taro_replay_uses_production_offset_ensemble_and_masks():
+    import asyncio
+    from types import SimpleNamespace
+
+    from gr00t.data.embodiment_tags import EmbodimentTag
+    from gr00t.data.types import ModalityConfig
+    from gr00t.eval.industrialnext_replay import replay_production
+    from gr00t.policy.industrialnext import load_industrialnext_profile
+    from gr00t.policy.industrialnext.async_server import IndustrialNextServingConfig
+    import pandas as pd
+
+    profile = load_industrialnext_profile("configs/embodiments/taro_exp_100.yaml")
+    observation = profile.build_synthetic_model_observation(profile.task_catalog.tasks[0].task_text)
+    data = {}
+    for key, value in observation["state"].items():
+        data[f"state.{key}"] = [value[0, 0]] * 20
+    for key, value in observation["video"].items():
+        data[f"video.{key}"] = [value[0, 0]] * 20
+    data["language.annotation.human.task_description"] = [
+        profile.task_catalog.tasks[0].task_text
+    ] * 20
+    actions = {
+        "right_eef": np.tile([0, 0, 0, 1, 0, 0, 0, 1, 0], (1, 40, 1)),
+        "right_hand": np.zeros((1, 40, 20)),
+    }
+    for key, value in actions.items():
+        data[f"action.{key}"] = [value[0, 0].copy() for _ in range(20)]
+        data[f"action_validity.{key}"] = [np.ones(value.shape[-1], dtype=bool) for _ in range(20)]
+    # A very wrong value in an unsupervised hand coordinate cannot affect error.
+    for target, mask in zip(data["action.right_hand"], data["action_validity.right_hand"]):
+        target[0] = 1000
+        mask[0] = False
+    data["observation.valid"] = [True] * 20
+    trajectory = pd.DataFrame(data)
+
+    class Loader:
+        modality_configs = {
+            modality: ModalityConfig(delta_indices=[0], modality_keys=list(observation[modality]))
+            for modality in ("video", "state")
+        }
+        modality_configs["language"] = ModalityConfig(
+            delta_indices=[0], modality_keys=["annotation.human.task_description"]
+        )
+        modality_configs["action"] = ModalityConfig(
+            delta_indices=list(range(40)), modality_keys=list(actions)
+        )
+
+        def __getitem__(self, index):
+            return trajectory
+
+    class Policy:
+        def get_action(self, observation, options=None):
+            return actions, {}
+
+    result = asyncio.run(
+        replay_production(
+            Policy(),
+            Loader(),
+            0,
+            EmbodimentTag.NEW_EMBODIMENT,
+            profile,
+            IndustrialNextServingConfig(action_offset=2),
+            SimpleNamespace(delay_trace=[2], seeds=[42], replay_steps=12),
+        )
+    )
+    assert result["status"] == "ok"
+    assert result["emitted_steps"] == 10
+    assert result["physical_errors"]["same_time"]["hand_native_abs"]["mean"] == 0
+    assert result["physical_errors"]["same_time"]["hand_native_abs"]["count"] == 190
+    first = next(step for step in result["steps"] if step.get("has_action"))
+    assert first["monitoring"]["emitted_action"]["contributions"][0]["model_row"] == 4

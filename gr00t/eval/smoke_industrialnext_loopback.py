@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib
 import json
 import math
 from pathlib import Path
+import sys
 import time
 from typing import Any
 
@@ -35,6 +37,7 @@ class LoopbackSmokeConfig:
     task_text: str | None = None
     steps: int = 60
     image_refresh_steps: int = 4
+    ros_client_source_dir: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.steps, bool) or not isinstance(self.steps, int) or self.steps <= 0:
@@ -111,7 +114,16 @@ def main(config: LoopbackSmokeConfig) -> None:
     if config.output_json_path is not None and output_path.exists():
         raise FileExistsError(f"loopback report already exists: {output_path}")
 
-    client = DirectClient(host, port)
+    if config.ros_client_source_dir is None:
+        client = DirectClient(host, port)
+    else:
+        source = Path(config.ros_client_source_dir).expanduser().resolve()
+        if not (source / "industrialnext_operator_policy_client" / "rpc_client.py").is_file():
+            raise ValueError("ros_client_source_dir must contain the policy client package")
+        sys.path.insert(0, str(source))
+        module = importlib.import_module("industrialnext_operator_policy_client.rpc_client")
+        client = module.RobustDirectClient(host, port, open_timeout_s=5.0, request_timeout_s=5.0)
+
     responses: list[dict[str, Any]] = []
     metadata: dict[str, Any] | None = None
     registration: dict[str, Any] | None = None
@@ -119,6 +131,11 @@ def main(config: LoopbackSmokeConfig) -> None:
     try:
         client.connect()
         metadata = client.get_metadata()
+        if config.ros_client_source_dir is not None:
+            client.require_async_protocol(
+                {"error_envelope_v2", "monitoring_in_step", "server_owned_gripper_snap"},
+                min_protocol_version=2,
+            )
         registration = client.request(
             {
                 "type": "register_session",
@@ -132,6 +149,7 @@ def main(config: LoopbackSmokeConfig) -> None:
         session_id = registration["session_id"]
         next_deadline = time.monotonic()
         for step in range(config.steps):
+            request_started = time.perf_counter()
             response = client.request(
                 {
                     "type": "step",
@@ -148,7 +166,11 @@ def main(config: LoopbackSmokeConfig) -> None:
             responses.append(
                 {
                     "step": step,
+                    "request_rtt_ms": (time.perf_counter() - request_started) * 1000,
+                    "inference_latency_ms": response.get("inference_latency_ms"),
+                    "queue_len": response.get("queue_len"),
                     "error": response.get("error"),
+                    "reason": response.get("reason"),
                     "has_action": action is not None,
                     "finite_action": action is None or _all_finite(action),
                     "monitoring_timestep": response.get("monitoring_timestep"),

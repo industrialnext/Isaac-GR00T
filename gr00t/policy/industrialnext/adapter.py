@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
+import time
 from types import MappingProxyType
 from typing import Any, Mapping, MutableMapping, Protocol
 
@@ -58,6 +59,7 @@ class CachedImage:
     payload: bytes
     metadata: Mapping[str, Any]
     updated_timestep: int
+    received_at_s: float = field(default_factory=lambda: time.monotonic())
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,7 @@ class ObservationSnapshot:
     task_text: str
     source_timestep: int
     generation: int
+    received_at_s: float = field(default_factory=lambda: time.monotonic())
 
 
 @dataclass(frozen=True)
@@ -141,6 +144,7 @@ def admit_observation(
         raise ValueError("observation must be a mapping")
     if max_image_staleness_steps < 0:
         raise ValueError("max_image_staleness_steps must be non-negative")
+    now_s = time.monotonic()
     state = {
         field_name: _finite_tuple(observation.get(field_name), width, field_name)
         for field_name, width in STATE_FIELD_WIDTHS
@@ -183,6 +187,7 @@ def admit_observation(
             payload=immutable_payload,
             metadata=_validate_rgb_metadata(metadata, field_name),
             updated_timestep=timestep,
+            received_at_s=now_s,
         )
 
     for metadata_name in raw_metadata:
@@ -205,7 +210,11 @@ def admit_observation(
     stale = tuple(
         name
         for name, age in image_ages.items()
-        if age is not None and age > max_image_staleness_steps
+        if age is not None
+        and (
+            age > max_image_staleness_steps
+            or now_s - image_cache[name].received_at_s > max(1, max_image_staleness_steps) / 50.0
+        )
     )
     snapshot = None
     if not missing and not stale:
@@ -216,6 +225,7 @@ def admit_observation(
             task_text=task_text,
             source_timestep=timestep,
             generation=generation,
+            received_at_s=now_s,
         )
     return ObservationAdmission(
         snapshot=snapshot,
@@ -232,14 +242,19 @@ def snapshot_is_fresh(
     current_timestep: int,
     active_generation: int,
     max_staleness_steps: int,
+    now_s: float | None = None,
 ) -> bool:
     """Return whether pending work is still current enough to launch."""
     if snapshot.generation != active_generation:
         return False
     if current_timestep - snapshot.source_timestep > max_staleness_steps:
         return False
+    now_s = time.monotonic() if now_s is None else now_s
+    if now_s - snapshot.received_at_s > max(1, max_staleness_steps) / 50.0:
+        return False
     return all(
-        current_timestep - image.updated_timestep <= max_staleness_steps
+        now_s - image.received_at_s <= max(1, max_staleness_steps) / 50.0
+        and current_timestep - image.updated_timestep <= max_staleness_steps
         for image in snapshot.images.values()
     )
 

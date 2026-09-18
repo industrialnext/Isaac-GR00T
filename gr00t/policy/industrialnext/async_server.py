@@ -11,13 +11,21 @@ from dataclasses import dataclass, field
 import logging
 import math
 import time
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 import uuid
 
 from industrialnext_rpc.direct.metadata import Metadata
 import numpy as np
 
 from .adapter import CachedImage, ObservationAdmission, ObservationSnapshot, snapshot_is_fresh
+from .execution import (
+    Contribution,
+    ExecutionSlot,
+    TransitionAnchor,
+    execution_tick,
+    freeze_action,
+    rotation_matrix,
+)
 from .profile_config import ConfigDrivenIndustrialNextProfile
 
 
@@ -32,11 +40,7 @@ ASYNC_CAPABILITIES = [
 
 
 def _source_rot6d_matrix(value: list[float]) -> np.ndarray:
-    axes = np.asarray(value, dtype=np.float64).reshape(2, 3)
-    first = axes[0] / np.linalg.norm(axes[0])
-    second = axes[1] - np.dot(first, axes[1]) * first
-    second = second / np.linalg.norm(second)
-    return np.stack((first, second, np.cross(first, second)), axis=1)
+    return rotation_matrix(value)
 
 
 def _rotation_error_rad(left: list[float], right: list[float]) -> float:
@@ -133,6 +137,13 @@ class IndustrialNextServingConfig:
     min_usable_action_steps: int = 1
     idle_session_timeout_s: float = 300.0
     stats_log_interval_steps: int = 250
+    action_offset: int = 0
+    ensemble_strategy: str = "temporal_exponential"
+    ensemble_coeff: float = 0.1
+    max_ensemble_chunks: int = 3
+    chunk_transition_frames: int = 4
+    max_action_lateness_s: float = 0.04
+    max_control_clock_drift_s: float = 0.1
     rtc_mode: str = "off"
     rtc_initial_frozen_steps: int = 1
     rtc_delay_window_size: int = 20
@@ -179,6 +190,36 @@ class IndustrialNextServingConfig:
             or self.stats_log_interval_steps < 0
         ):
             raise ValueError("stats_log_interval_steps must be a non-negative integer")
+        for name in ("action_offset", "max_ensemble_chunks", "chunk_transition_frames"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        if self.action_offset > self.action_horizon - self.min_usable_action_steps:
+            raise ValueError("action_offset must leave min_usable_action_steps")
+        if self.max_ensemble_chunks < 1:
+            raise ValueError("max_ensemble_chunks must be positive")
+        if self.chunk_transition_frames > self.action_horizon - self.action_offset:
+            raise ValueError("chunk_transition_frames exceeds selectable horizon")
+        if self.ensemble_strategy not in {"temporal_exponential", "latest_only"}:
+            raise ValueError("ensemble_strategy must be temporal_exponential or latest_only")
+        if (
+            isinstance(self.ensemble_coeff, bool)
+            or not math.isfinite(self.ensemble_coeff)
+            or self.ensemble_coeff < 0
+        ):
+            raise ValueError("ensemble_coeff must be finite and nonnegative")
+        for name in ("max_action_lateness_s", "max_control_clock_drift_s"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if self.rtc_mode != "off" and (
+            self.action_offset
+            or self.ensemble_strategy != "latest_only"
+            or self.chunk_transition_frames
+        ):
+            raise ValueError(
+                "RTC requires --action-offset 0 --ensemble-strategy latest_only --chunk-transition-frames 0"
+            )
         if self.rtc_mode not in {"off", "native", "trained_prefix"}:
             raise ValueError("rtc_mode must be one of: off, native, trained_prefix")
         integer_fields = {
@@ -294,12 +335,13 @@ class ActiveSession:
     timestep: int = -1
     monitoring_timestep: int = -1
     image_cache: dict[str, CachedImage] = field(default_factory=dict)
-    timeline: dict[int, dict[str, list[float]]] = field(default_factory=dict)
+    timeline: dict[int, ExecutionSlot] = field(default_factory=dict)
     served_history: dict[int, dict[str, list[float]]] = field(default_factory=dict)
     observed_delays: list[int] = field(default_factory=list)
     inference_status: str = "idle"
     inference_latency_ms: float = 0.0
     image_decode_latency_ms: float = 0.0
+    source_to_result_latency_ms: float = 0.0
     total_inferences: int = 0
     total_actions_served: int = 0
     latest_inference_error: str | None = None
@@ -323,6 +365,11 @@ class ActiveSession:
     latest_first_admitted_position_seam_m: float = 0.0
     latest_first_admitted_orientation_seam_rad: float = 0.0
     latest_first_admitted_gripper_seam: float = 0.0
+    epoch_time_s: float | None = None
+    last_emitted_at_s: float | None = None
+    latest_emitted_provenance: dict[str, Any] = field(default_factory=dict)
+    latest_emitted_dynamics: tuple[float, ...] = ()
+    terminal_reason: str | None = None
     requires_reregistration: bool = False
     stats: SessionStats = field(default_factory=SessionStats)
 
@@ -340,11 +387,13 @@ class IndustrialNextAsyncServer:
         embodiment_tag: str,
         profile: ConfigDrivenIndustrialNextProfile,
         owns_executor: bool = True,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         if config.action_horizon != profile.action_horizon:
             raise ValueError("serving config action_horizon differs from the profile")
         if config.rtc_mode not in profile.supported_rtc_modes:
             raise ValueError(f"rtc_mode {config.rtc_mode!r} is not supported by the profile")
+        self.clock = time.monotonic if clock is None else clock
         self.policy = policy
         self.executor = executor
         self.task_catalog = profile.task_catalog
@@ -471,6 +520,24 @@ class IndustrialNextAsyncServer:
         task_catalog = self.task_catalog.to_metadata()
         return {
             **self.service_provenance,
+            "execution": {
+                "mode": "fixed_offset",
+                "action_offset": self.config.action_offset,
+                "target_source_offset": self.profile.action_start_offset_steps,
+                "output_hz": self.config.control_hz,
+                "speed_factor": 1.0,
+                "timestamp_clock": "server_monotonic",
+                "tick_clock": "accepted_requests",
+                "max_action_lateness_s": self.config.max_action_lateness_s,
+                "max_control_clock_drift_s": self.config.max_control_clock_drift_s,
+            },
+            "default_ensemble": {
+                "strategy": self.config.ensemble_strategy,
+                "temporal_coeff": self.config.ensemble_coeff,
+                "max_ensemble_chunks": self.config.max_ensemble_chunks,
+                "chunk_transition_frames": self.config.chunk_transition_frames,
+                "gripper_blend_mode": "continuous",
+            },
             "async_serving": True,
             "async_protocol_version": ASYNC_PROTOCOL_VERSION,
             "async_capabilities": list(ASYNC_CAPABILITIES),
@@ -536,7 +603,7 @@ class IndustrialNextAsyncServer:
             None if self._active_session is None else self._active_session.session_id
         )
         self._generation += 1
-        now_s = time.monotonic()
+        now_s = self.clock()
         session = ActiveSession(
             session_id=str(uuid.uuid4()),
             generation=self._generation,
@@ -577,6 +644,8 @@ class IndustrialNextAsyncServer:
     def _step(self, request: Mapping[str, Any]) -> dict[str, Any]:
         step_started_at = time.perf_counter()
         session = self._session(str(request.get("session_id", "")))
+        if session.requires_reregistration:
+            return self._terminal_response(session)
         candidate_timestep = session.timestep + 1
         observation = request.get("observation")
         if not isinstance(observation, Mapping):
@@ -589,24 +658,55 @@ class IndustrialNextAsyncServer:
             task_text=session.task_text,
             generation=session.generation,
             max_image_staleness_steps=self.config.max_image_staleness_steps,
+            now_s=self.clock(),
         )
 
+        now_s = self.clock()
+        if session.epoch_time_s is None:
+            session.epoch_time_s = now_s
+        drift_s = now_s - session.epoch_time_s - candidate_timestep / self.config.control_hz
+        if abs(drift_s) > self.config.max_control_clock_drift_s:
+            self._terminate(session, f"control_clock_drift: {drift_s:.6f}s")
+            return self._terminal_response(session)
+        if self._command_gap_expired(session, now_s):
+            self._terminate(session, "command_gap_expired")
+            return self._terminal_response(session)
         session.timestep = candidate_timestep
         session.monitoring_timestep += 1
-        session.last_activity_s = time.monotonic()
+        session.last_activity_s = self.clock()
         session.latest_image_ages = dict(admission.image_ages)
         session.stats.missing_rgb_steps += int(bool(admission.missing_images))
         session.stats.stale_rgb_steps += int(bool(admission.stale_images))
         session.stats.ignored_depth_fields += admission.ignored_depth_fields
         self._schedule_idle_expiry(session)
 
-        expired_targets = [target for target in session.timeline if target < candidate_timestep]
-        for target in expired_targets:
-            del session.timeline[target]
-        session.stats.expired_rows += len(expired_targets)
-
-        action = session.timeline.pop(candidate_timestep, None)
-        if action is not None:
+        self._expire_timeline(session, now_s, candidate_timestep)
+        slot = session.timeline.pop(candidate_timestep, None)
+        action = None
+        session.latest_emitted_provenance = {}
+        if slot is not None:
+            try:
+                action, provenance = self._resolve_slot(slot)
+                previous = list(session.served_history.values())[-2:]
+                dynamics = _trajectory_dynamics(tuple(previous + [action]), self.profile)
+                if self._dynamics_exceeded(dynamics):
+                    raise ValueError(f"emitted_action_dynamics_limit: {dynamics}")
+                seam = (
+                    _prefix_errors((previous[-1],), (action,), 1, self.profile)
+                    if previous
+                    else (0.0, 0.0, 0.0)
+                )
+            except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+                self._terminate(session, str(exc))
+                return self._terminal_response(session)
+            session.latest_emitted_dynamics = dynamics
+            (
+                session.latest_first_admitted_position_seam_m,
+                session.latest_first_admitted_orientation_seam_rad,
+                session.latest_first_admitted_gripper_seam,
+            ) = seam
+            session.latest_emitted_provenance = {"execution_tick": candidate_timestep, **provenance}
+            session.last_emitted_at_s = now_s
             session.served_history[candidate_timestep] = action
             oldest_history = candidate_timestep - self.profile.action_horizon + 1
             session.served_history = {
@@ -632,6 +732,8 @@ class IndustrialNextAsyncServer:
             session.latest_null_reason = null_reason
             session.stats.record_null(null_reason)
 
+        if session.requires_reregistration:
+            return self._terminal_response(session)
         server_step_ms = (time.perf_counter() - step_started_at) * 1000.0
         response = self._step_success_response(
             session=session,
@@ -640,6 +742,61 @@ class IndustrialNextAsyncServer:
         )
         self._maybe_log_stats(session, server_step_ms=server_step_ms)
         return response
+
+    def _resolve_slot(self, slot: ExecutionSlot) -> tuple[dict[str, list[float]], dict]:
+        return slot.resolve(
+            strategy=self.config.ensemble_strategy,
+            coefficient=self.config.ensemble_coeff,
+            control_hz=self.config.control_hz,
+            rotation_fields=self.profile.rotation_action_fields,
+        )
+
+    def _expire_timeline(self, session: ActiveSession, now_s: float, first_tick: int) -> None:
+        for tick, slot in list(session.timeline.items()):
+            live = slot.live(now_s)
+            if tick < first_tick or not live.contributions:
+                del session.timeline[tick]
+                session.stats.expired_rows += 1
+            else:
+                session.timeline[tick] = live
+
+    def _command_gap_expired(self, session: ActiveSession, now_s: float) -> bool:
+        return (
+            session.last_emitted_at_s is not None
+            and now_s
+            > session.last_emitted_at_s
+            + 1 / self.config.control_hz
+            + self.config.max_action_lateness_s
+        )
+
+    def _dynamics_exceeded(self, dynamics: tuple[float, ...]) -> bool:
+        limits = (
+            self.config.max_position_step_m,
+            self.config.max_orientation_step_rad,
+            self.config.max_gripper_step,
+            self.config.max_position_second_difference_m,
+            self.config.max_gripper_second_difference,
+        )
+        return any(limit is not None and value > limit for value, limit in zip(dynamics, limits))
+
+    def _terminate(self, session: ActiveSession, reason: str) -> None:
+        if session.terminal_reason is None:
+            session.terminal_reason = reason[:512]
+        session.requires_reregistration = True
+        session.inference_status = "session_unusable"
+        session.timeline.clear()
+        if (
+            self._pending_snapshot is not None
+            and self._pending_snapshot.generation == session.generation
+        ):
+            self._pending_snapshot = None
+
+    def _terminal_response(self, session: ActiveSession) -> dict[str, Any]:
+        return {
+            **self._error_response("step", "session_unusable"),
+            "reason": session.terminal_reason,
+            "timestep": session.timestep,
+        }
 
     def _session(self, session_id: str) -> ActiveSession:
         session = self._active_session
@@ -655,7 +812,11 @@ class IndustrialNextAsyncServer:
         for target in range(target_start, target_start + self.profile.action_horizon):
             row = session.served_history.get(target)
             if row is None:
-                row = session.timeline.get(target)
+                slot = session.timeline.get(target)
+                live = None if slot is None else slot.live(self.clock())
+                row = (
+                    self._resolve_slot(live)[0] if live is not None and live.contributions else None
+                )
             if row is None:
                 break
             rows.append(row)
@@ -690,7 +851,7 @@ class IndustrialNextAsyncServer:
                 f"{self.config.rtc_max_prefix_steps}"
             )
             if not session.timeline:
-                session.requires_reregistration = True
+                self._terminate(session, session.latest_inference_error or session.inference_status)
             return None
         if available < predicted:
             session.inference_status = "missing_prefix"
@@ -699,7 +860,7 @@ class IndustrialNextAsyncServer:
             )
             session.stats.missing_prefixes += 1
             if not session.timeline:
-                session.requires_reregistration = True
+                self._terminate(session, session.latest_inference_error or session.inference_status)
             return None
 
         if self.config.rtc_mode == "native":
@@ -741,6 +902,7 @@ class IndustrialNextAsyncServer:
                 current_timestep=session.timestep,
                 active_generation=session.generation,
                 max_staleness_steps=self.config.max_image_staleness_steps,
+                now_s=self.clock(),
             )
         ):
             if session is not None:
@@ -801,12 +963,19 @@ class IndustrialNextAsyncServer:
         try:
             result = future.result()
         except Exception as exc:
-            if session is not None and session.generation == request.snapshot.generation:
+            if (
+                session is not None
+                and not session.requires_reregistration
+                and session.generation == request.snapshot.generation
+            ):
                 session.inference_status = "error"
                 session.latest_inference_error = f"{type(exc).__name__}: {exc}"
                 session.stats.inference_failures += 1
+                self._expire_timeline(session, self.clock(), session.timestep + 1)
                 if not session.timeline:
-                    session.requires_reregistration = True
+                    self._terminate(
+                        session, session.latest_inference_error or session.inference_status
+                    )
                 logger.error(
                     "GR00T inference failed",
                     exc_info=(type(exc), exc, exc.__traceback__),
@@ -815,12 +984,25 @@ class IndustrialNextAsyncServer:
             if (
                 not self._closed
                 and session is not None
+                and not session.requires_reregistration
                 and session.generation == result.request.snapshot.generation
             ):
-                self._admit_inference_result(session, result)
+                try:
+                    self._expire_timeline(session, self.clock(), session.timestep + 1)
+                    self._admit_inference_result(session, result)
+                except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+                    session.latest_inference_error = f"postprocessing_error: {exc}"
+                    session.inference_status = "postprocessing_error"
+                    if not session.timeline:
+                        self._terminate(session, session.latest_inference_error)
         self._launch_pending_if_valid()
 
     def _admit_inference_result(self, session: ActiveSession, result: InferenceResult) -> None:
+        if session.requires_reregistration:
+            return
+        if self._command_gap_expired(session, self.clock()):
+            self._terminate(session, "command_gap_expired")
+            return
         request = result.request
         target_start = request.snapshot.source_timestep + self.profile.action_start_offset_steps
         actual_delay = max(0, session.timestep - target_start + 1)
@@ -829,6 +1011,7 @@ class IndustrialNextAsyncServer:
         session.observed_delays = session.observed_delays[-self.config.rtc_delay_window_size :]
         session.inference_latency_ms = result.inference_latency_ms
         session.image_decode_latency_ms = result.image_decode_latency_ms
+        session.source_to_result_latency_ms = (self.clock() - request.snapshot.received_at_s) * 1000
         session.total_inferences += 1
         session.latest_source_timestep = request.snapshot.source_timestep
         session.stats.record_fields(result.rows, self.profile.gripper_action_keys)
@@ -841,18 +1024,6 @@ class IndustrialNextAsyncServer:
             session.latest_max_position_second_difference_m,
             session.latest_max_gripper_second_difference,
         ) = dynamics
-        if 0 < actual_delay < len(result.rows):
-            seam = _prefix_errors(
-                (result.rows[actual_delay - 1],),
-                (result.rows[actual_delay],),
-                1,
-                self.profile,
-            )
-            (
-                session.latest_first_admitted_position_seam_m,
-                session.latest_first_admitted_orientation_seam_rad,
-                session.latest_first_admitted_gripper_seam,
-            ) = seam
         limits = (
             self.config.max_position_step_m,
             self.config.max_orientation_step_rad,
@@ -872,7 +1043,7 @@ class IndustrialNextAsyncServer:
             )
             session.inference_status = "action_dynamics_limit"
             if not session.timeline:
-                session.requires_reregistration = True
+                self._terminate(session, session.latest_inference_error or session.inference_status)
             return
 
         if request.rtc_mode != "off" and actual_delay > request.predicted_frozen_steps:
@@ -883,7 +1054,7 @@ class IndustrialNextAsyncServer:
             )
             session.inference_status = "delay_underestimate"
             if not session.timeline:
-                session.requires_reregistration = True
+                self._terminate(session, session.latest_inference_error or session.inference_status)
             return
 
         if request.rtc_mode != "off":
@@ -910,25 +1081,108 @@ class IndustrialNextAsyncServer:
                 )
                 session.inference_status = "prefix_mismatch"
                 if not session.timeline:
-                    session.requires_reregistration = True
+                    self._terminate(
+                        session, session.latest_inference_error or session.inference_status
+                    )
                 return
 
-        future_rows = {
-            target_start + index: row
-            for index, row in enumerate(result.rows)
-            if target_start + index > session.timestep
-        }
+        now_s = self.clock()
+        self._expire_timeline(session, now_s, session.timestep + 1)
+        future_rows = {}
+        for index in range(self.config.action_offset, len(result.rows)):
+            target = execution_tick(
+                request.snapshot.source_timestep,
+                self.profile.action_start_offset_steps,
+                self.config.action_offset,
+                index,
+            )
+            deadline = (
+                request.snapshot.received_at_s
+                + (target - request.snapshot.source_timestep) / self.config.control_hz
+                + self.config.max_action_lateness_s
+            )
+            if target > session.timestep and now_s <= deadline:
+                future_rows[target] = Contribution(
+                    freeze_action(result.rows[index]),
+                    request.snapshot.source_timestep,
+                    index,
+                    request.snapshot.received_at_s,
+                    deadline,
+                )
         if len(future_rows) < self.config.min_usable_action_steps:
             session.stats.rejected_tails += 1
-            session.latest_inference_error = (
-                "insufficient_usable_tail: "
-                f"{len(future_rows)} < {self.config.min_usable_action_steps}"
-            )
+            session.latest_inference_error = f"insufficient_usable_tail: {len(future_rows)} < {self.config.min_usable_action_steps}"
             session.inference_status = "insufficient_tail"
             if not session.timeline:
-                session.requires_reregistration = True
+                self._terminate(session, session.latest_inference_error)
             return
-        session.timeline = future_rows
+        # Resolve before mutation: an invalid rotation must not partly install a chunk.
+        updated = dict(session.timeline)
+        anchor_ticks = set(list(future_rows)[: self.config.chunk_transition_frames])
+        if session.timeline:
+            anchor_ticks.add(max(session.timeline))
+        old_outputs = {
+            tick: self._resolve_slot(session.timeline[tick])
+            for tick in anchor_ticks
+            if tick in session.timeline
+        }
+        old_tail = max(session.timeline) if session.timeline else None
+        append = old_outputs[old_tail] if old_tail is not None else None
+        append_deadline = (
+            session.timeline[old_tail].anchor_deadline() if old_tail is not None else math.inf
+        )
+        if append is None and session.served_history:
+            append = (
+                list(session.served_history.values())[-1],
+                {"contributions": [], "transition": None},
+            )
+        frame_index = 0
+        for target, contribution in future_rows.items():
+            previous_slot = session.timeline.get(target)
+            contributions = () if previous_slot is None else previous_slot.contributions
+            contributions = tuple(
+                c for c in contributions if c.source_tick != contribution.source_tick
+            ) + (contribution,)
+            contributions = tuple(
+                sorted(contributions, key=lambda c: (c.received_at_s, c.source_tick))
+            )[-self.config.max_ensemble_chunks :]
+            if self.config.ensemble_strategy == "latest_only":
+                contributions = contributions[-1:]
+            slot = ExecutionSlot(contributions)
+            prior = old_outputs.get(target, append)
+            frames = self.config.chunk_transition_frames
+            if frame_index < frames and prior is not None:
+                new_output, _ = self._resolve_slot(slot)
+                old_action, provenance = prior
+                deadline = (
+                    previous_slot.anchor_deadline()
+                    if previous_slot is not None
+                    else append_deadline
+                )
+                if now_s <= deadline and any(
+                    not np.allclose(old_action[key], new_output[key], atol=1e-6)
+                    for key in new_output
+                ):
+                    u = (frame_index + 1) / frames
+                    sources = list(provenance["contributions"])
+                    if provenance["transition"] is not None:
+                        sources.extend(provenance["transition"]["sources"])
+                    sources = list(
+                        {(v["source_tick"], v["model_row"]): v for v in sources}.values()
+                    )
+                    slot = ExecutionSlot(
+                        contributions,
+                        TransitionAnchor(
+                            freeze_action(old_action),
+                            deadline,
+                            3 * u * u - 2 * u * u * u,
+                            tuple(sources),
+                        ),
+                    )
+            frame_index += 1
+            self._resolve_slot(slot)
+            updated[target] = slot
+        session.timeline = updated
         session.latest_inference_error = None
         session.inference_status = "ready"
 
@@ -943,6 +1197,7 @@ class IndustrialNextAsyncServer:
             current_timestep=session.timestep,
             active_generation=session.generation,
             max_staleness_steps=self.config.max_image_staleness_steps,
+            now_s=self.clock(),
         ):
             if session is not None:
                 session.stats.stale_pending_snapshots += 1
@@ -965,7 +1220,7 @@ class IndustrialNextAsyncServer:
         session = self._active_session
         if session is None or session.session_id != session_id or session.generation != generation:
             return
-        idle_s = time.monotonic() - session.last_activity_s
+        idle_s = self.clock() - session.last_activity_s
         remaining_s = self.config.idle_session_timeout_s - idle_s
         if remaining_s > 0:
             loop = self._event_loop
@@ -1014,13 +1269,26 @@ class IndustrialNextAsyncServer:
         action: dict[str, list[float]] | None,
         server_step_ms: float,
     ) -> dict[str, Any]:
-        now_s = time.monotonic()
-        action_age = (
-            None
-            if session.latest_source_timestep is None
-            else session.timestep - session.latest_source_timestep
+        now_s = self.clock()
+        sources = session.latest_emitted_provenance.get("contributions", [])
+        action_age = max(
+            (session.timestep - source["source_tick"] for source in sources), default=None
         )
         monitoring = {
+            "source_to_result_latency_ms": session.source_to_result_latency_ms,
+            "action_source_age_s": [now_s - source["received_at_s"] for source in sources],
+            "emitted_action": session.latest_emitted_provenance,
+            "emitted_dynamics": session.latest_emitted_dynamics,
+            "raw_chunk_dynamics": [
+                session.latest_max_position_step_m,
+                session.latest_max_orientation_step_rad,
+                session.latest_max_gripper_step,
+                session.latest_max_position_second_difference_m,
+                session.latest_max_gripper_second_difference,
+            ],
+            "image_age_s": {
+                name: now_s - cached.received_at_s for name, cached in session.image_cache.items()
+            },
             "progress": 0.0,
             "classification": "unknown",
             "scene_valid": True,

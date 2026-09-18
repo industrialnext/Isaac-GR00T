@@ -115,7 +115,8 @@ Its metadata request validates the declared request/response schemas.
 
 Registration requires the exact configured UUID/text pair and 50 Hz. Metadata advertises
 async protocol version 2, `error_envelope_v2`, `monitoring_in_step`, and
-`server_owned_gripper_snap`. Gripper snap is explicitly disabled; values pass through.
+`server_owned_gripper_snap`. Gripper snap is explicitly disabled; native hand/gripper coordinates blend continuously.
+Successful responses omit `error`; clients must use `response.get("error")`.
 Compare the advertised task catalog, dimensions, fields, and capabilities with the actual
 deployment client before connecting its control loop.
 
@@ -143,7 +144,7 @@ response = client.request({
     "session_id": session_id,
     "observation": observation,
 })
-if response["error"]:
+if response.get("error"):
     raise RuntimeError(response["error"])
 action = response["action"]  # None is a supported response, not a zero command.
 ```
@@ -174,26 +175,63 @@ fields and converts source-column rot6d to GR00T-row rot6d using the same
 For the relative EEF examples, these are already absolute poses: **do not add the live
 state again**. The adapter converts rotations back to source columns and returns flat
 wire-field lists. F/T inputs and gripper/hand values are not automatically rescaled into
-different units. No server-side gripper clipping or smoothing is added.
+different units. No scalar-gripper clipping or snapping is added. The default ensemble and transition
+blend native hand coordinates continuously in physical units.
 
-For observation timestep `s`, row `i` targets:
+Keep the training target offset `D = action.observation_offset` separate from serving
+lookahead `K = --action-offset`. Discard original model rows `i < K`, then schedule:
 
 ```text
-target_timestep = s + action.observation_offset + i
+execution_tick = source_tick + D + i - K
+first executable original row = K + max(0, last_consumed_tick + 1 - source_tick - D)
 ```
 
-One background inference and at most one replaceable pending snapshot keep work bounded.
-`step` continues responding while inference runs. Pending observations are rechecked for
-freshness before launch. Valid new chunks replace the older unserved future timeline;
-expired rows are dropped rather than replayed from row zero. Each accepted step advances
-the session clock and returns only that tick's action. Pace requests at 50 Hz: the timeline
-is indexed by accepted steps, not by an independent wall-clock robot scheduler.
+For source tick 100, consumed tick 104, D=0 and K=2, model row 7 contributes to tick
+105. Offset applies to the first chunk too. The 40-row horizon leaves 38 selectable
+rows before latency trimming. It never changes the dataset's target offset or playback
+speed; speed remains 1× and output remains 50 Hz.
 
-Missing/stale images prevent a new inference snapshot; previously admitted, unexpired
-timeline actions can still be returned. Malformed observations return errors. Inference
-or output failures admit no new chunk; existing valid future rows may remain. An empty
-timeline returns `None`. ROS owns the resulting no-publication/hold behavior; the server
-does not fabricate a hold command or loop an old trajectory.
+The output order is physical decoding, offset/age admission, same-tick ensemble,
+transition smoothing, final command checks, then wire output and served history.
+Defaults are `temporal_exponential`, coefficient 0.1, newest three contributions per
+tick, and four transition frames. Temporal weights are proportional to
+`exp(-coefficient * (newest_source_receipt - source_receipt) * 50)`. Positions and
+native hand coordinates use weighted means; rotations use a quaternion scatter mean.
+Transitions use SO(3) interpolation and cubic smoothstep weights
+0.15625, 0.5, 0.84375, 1.0 from the previously planned command. This is chunk-transition
+smoothing, not DEFT's startup/human-handover ramp. No output EMA is applied.
+
+`--ensemble-strategy latest_only` disables ensemble; `--chunk-transition-frames 0`
+disables transition smoothing independently. Profile values use the corresponding
+`serving` keys; CLI values take precedence. Old profiles omit these keys and receive
+the new ensemble/smoothing defaults, while their execution offset stays 0. The Taro
+launch below explicitly selects offset 2 without changing frozen training YAML.
+
+One inference worker and one replaceable pending observation keep work bounded.
+Expiry occurs before admission and emission. Image freshness uses both accepted ticks
+and server-monotonic receipt time (five steps / 0.1 s by default); zero permitted reuse
+requires a same-tick image and allows receipt within one control period. This is not a
+sensor capture-time guarantee. Each contribution expires at its mapped due time plus
+`--max-action-lateness-s` (0.04 s). Transition anchors inherit the earliest source
+deadline; they cannot keep expired predictions executable.
+
+Pace requests at 50 Hz. `--max-control-clock-drift-s` defaults to 0.1 s relative to the
+first valid request; exceeding it ends the session instead of renumbering ticks.
+These timing values are engineering defaults requiring deployment jitter measurement.
+A temporary null can hold the prior ROS command; after emission begins, a command gap
+beyond the next expected period plus the lateness allowance becomes terminal.
+
+Irrecoverable failures return `error: "session_unusable"`, a bounded `reason`, and no
+action. The paired ROS client stops the matching run under its run-generation lock,
+clears held commands/slowdown state and retires the connection. A delayed old-run error
+cannot stop a new run. Explicit operator new-run recovery is required; this error does
+not trigger automatic re-registration. Transport loss is a separate client lifecycle.
+
+Monitoring separates raw-chunk dynamics from actual emitted seam/dynamics, and includes
+contributor source ticks, original rows, weights, transition anchors, image ages,
+source-to-result latency and usable tail. Optional command limits apply to the actual
+postprocessed sequence as well as raw chunk admission. This is a served-command check,
+not a measured robot-pose or actuator-acknowledgement guarantee.
 
 Monitoring reports `progress=0.0`, classification `unknown`, confidence zero and a fresh
 monitoring timestep. `scene_valid=true` in this compatibility response is not a learned
@@ -204,9 +242,15 @@ manual-stop lifecycle rather than waiting for progress to reach a threshold.
 
 | Mode | Requirement | Behavior |
 |---|---|---|
-| `off` | Compatible saved model/profile | Independent chunks with age-correct replacement |
+| `off` | Compatible saved model/profile | Offset, ensemble and transition recipe; default |
 | `native` | Compatible N1.7 model and profile support | Prior-prefix seeding, frozen prefix, velocity ramp; no prefix-training requirement |
 | `trained_prefix` | Saved positive `rtc_training_max_prefix_steps` and profile support | Hard prefix with training-time tokenwise conditioning |
+
+RTC requires `--action-offset 0 --ensemble-strategy latest_only
+--chunk-transition-frames 0`. Other combinations are rejected before model loading.
+Existing RTC launch commands must add these flags explicitly. The Taro profiles advertise
+only `off`; native RTC needs a separately qualified serving profile. Current Taro
+checkpoints have no trained-prefix support.
 
 The modes are alternatives, not stacked stages. Native RTC is the repository's prefix/ramp
 mechanism, not the full gradient-guided RTC algorithm. The first inference after registration
@@ -245,23 +289,46 @@ Runtime maximum prefix must fit the checkpoint's trained maximum for `trained_pr
 prefix/overlap bounds must leave the configured new tail. Optional position, orientation,
 gripper step and second-difference limits reject chunks; they do not modify predictions.
 
-For the original semihumanoid contract, a checkpoint benchmark supports latency and
-held-out sequential replay:
+The benchmark is profile-driven and uses the production server for sequential replay:
 
 ```bash
-uv run --no-sync --extra industrialnext python \
-  gr00t/eval/benchmark_industrialnext_rtc.py \
-  --model-path "$MODEL" --output-dir /tmp/gr00t-rtc-benchmark \
-  --dataset-path /absolute/path/to/converted/ube_val \
-  --trajectory-ids 0 1 2 --modes off native trained_prefix
+.venv/bin/python gr00t/eval/benchmark_industrialnext_rtc.py \
+  --profile-config configs/embodiments/taro_exp_100.yaml \
+  --model-path "$MODEL" --output-dir outputs/gr00t/serving_validation/UNIQUE_RUN \
+  --dataset-path data/training_data/gr00t/taro_exp_full --modes off
 ```
 
-Choose a new output directory for each benchmark run; an existing directory is rejected.
-This benchmark uses semihumanoid helpers and is **not config-driven for arbitrary
-embodiments**. Unsupported checkpoint modes are reported. Compare the same seeds/delay
-trace across modes and inspect accuracy, coverage, holds/rejections, pose seams and finite
-differences. Profile-driven loopback remains the generic transport smoke. Startup warmup
-uses ordinary inference; it does not validate all configured RTC refresh behavior.
+The full conversion root selects its three explicit `*_val` datasets, totaling 81
+shared holdout episodes in the frozen preparation. Use this same root for both model
+variants. All episodes are selected by default; `--trajectory-ids 0 1 2` limits each
+subset to those indices for a shorter check. A direct LeRobot dataset root is also accepted.
+Each selected episode replays its first 100 data frames by default; set `--replay-steps`
+to cover the desired evaluation window. The delay trace uses integer 50 Hz periods.
+Use a new output directory, a completed checkpoint, and an available GPU. Saved checkpoint
+processors/statistics remain authoritative; do not refit on holdout. Defaults run six
+matched recipes: unprocessed control, offset only, ensemble only, transition only,
+postprocessing with offset 0, and the default offset 2 recipe. `--no-run-ablations`
+selects only the explicit settings. RTC experiments additionally require the disable
+flags above and a profile/checkpoint advertising that mode.
+
+Reports retain masks and distinguish EEF metres, geodesic orientation radians and native
+hand error. Nominal lookahead-target error and same-time error are separate. Per-step output
+also compares the final command with each contributor's selected original dataset
+target, preserving source-to-data indices across masked observation gaps. Output
+records identify original rows, contributors, transitions, coverage, nulls and terminal
+failures. Sequential replay uses a virtual delay trace; it does not measure deployment
+latency or closed-loop success. Fixed-input model latency is reported separately.
+
+The transport smoke can also load the actual ROS RPC client, without ROS node imports:
+
+```bash
+.venv/bin/python gr00t/eval/smoke_industrialnext_loopback.py --config "$CFG" \
+  --ros-client-source-dir /home/azureuser/industrialnext_ros2/src/industrialnext_operator_ros2/industrialnext_operator_policy_client \
+  --output-json-path outputs/gr00t/serving_validation/UNIQUE_ROS_SMOKE.json
+```
+
+It records request RTT and server monitoring for metadata/register/step/close exchanges.
+It does not qualify the ROS node's publication lifecycle.
 
 ## Deployment validation and handoff
 
@@ -344,9 +411,15 @@ three model keys used by conversion. External RGB/depth are explicitly ignored.
 ```bash
 source .venv/bin/activate
 export HF_HUB_CACHE="$PWD/outputs/gr00t/huggingface/hub"
-python gr00t/eval/run_gr00t_industrialnext_server.py \
+: "${MIN_USABLE_ACTION_STEPS:?Set from measured p99 source-to-result latency}"
+: "${SERVING_GPU:?Set a GPU available for serving}"
+CUDA_VISIBLE_DEVICES="$SERVING_GPU" python gr00t/eval/run_gr00t_industrialnext_server.py \
   --config configs/embodiments/taro_exp_100.yaml \
-  --model-path outputs/gr00t/EXACT_TARO_100_RUN/checkpoint-40000
+  --model-path outputs/gr00t/EXACT_TARO_100_RUN/checkpoint-40000 \
+  --action-offset 2 --rtc-mode off \
+  --ensemble-strategy temporal_exponential --ensemble-coeff 0.1 \
+  --max-ensemble-chunks 3 --chunk-transition-frames 4 \
+  --min-usable-action-steps "$MIN_USABLE_ACTION_STEPS"
 ```
 
 The required low-dimensional observations are left/right EEF position (3) and
@@ -354,6 +427,26 @@ source-column rot6d (6), plus the native 20-coordinate `right_hand`, in the orde
 bound by `outputs/gr00t/preparation/taro_split.json`. Responses contain right EEF
 and right-hand commands only. Gripper snapping and RTC are disabled. The server
 expects 256×256 JPEG RGB with matching metadata at the 50 Hz control contract.
-Do not copy DEFT's temporal ensemble, fixed action selection offset, or playback
-speed into this baseline. Validate the real deployment's field names, hand order,
-pose frames, image freshness, and latency before robot use.
+This recipe enables DEFT-style temporal ensemble and chunk transitions, with execution
+offset 2 and fixed 1× speed. Size the usable-tail requirement to at least
+`ceil(p99_source_to_result_seconds * 50) + 1` and demonstrate that the remaining horizon
+covers it. Do not infer this budget from training throughput.
+
+The paired ROS client derives commanded components from `action_fields`, while retaining
+required bilateral observations. Cold-start hand initialization uses the same declared
+command scope. Use `inference_mode=true` for a publication-disabled
+shadow run. For a strict GR00T profile, set its ROS parameter `expected_eef_frame` to the
+locally verified semantic frame contract (`per_arm_flexiv_base` for these profiles), and
+configure real per-arm TF base frames; measured pose frame IDs must match those bases.
+This parameter is an operator declaration, not an automatic transform or calibration.
+Pass it in the existing ROS parameter YAML (`config_file`); no new launch wrapper is needed.
+
+Validate native hand joint order and camera ROI/crop against the checkpoint-linked
+preparation and actual robot configuration. Width 20 alone does not prove joint order.
+The checked-in ROS 10-DOF/bottom-camera Taro configuration is incompatible with this
+20-coordinate/fisheye contract; do not alias it into compatibility. Record the exact
+paired client revision and validation reports before motion. Frozen training configs,
+normalizers and data remain unchanged.
+
+Rollback: explicitly stop, then select offset 0, `latest_only`, zero transition frames,
+RTC off and the prior qualified checkpoint/client. Clear sessions and cached inputs.
