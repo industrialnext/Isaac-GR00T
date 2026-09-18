@@ -912,6 +912,125 @@ def test_clock_drift_and_command_gap_fail_closed_without_restarting():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("inference_cycles", [15, 18])
+def test_elapsed_clock_serves_delayed_inference_with_missed_client_cycles(inference_cycles):
+    from gr00t.policy.industrialnext.adapter import ObservationSnapshot
+    from gr00t.policy.industrialnext.async_server import InferenceRequest, InferenceResult
+
+    async def scenario():
+        server = _server(
+            _FakePolicy(),
+            control_clock_mode="elapsed_time",
+            action_offset=2,
+            max_control_clock_drift_s=0.1,
+            max_action_lateness_s=0.04,
+            max_command_gap_s=0.2,
+        )
+        now = [100.0]
+        server.clock = lambda: now[0]
+        try:
+            session_id = _register(server)
+            _step(server, session_id)
+            session = server._active_session
+            rows = server.profile.map_action_chunk(_decoded_action())
+            snapshot = ObservationSnapshot(
+                {}, {}, TASK_UUID, TASK_TEXT, 0, session.generation, now[0]
+            )
+            actions = 0
+            # A 40 Hz request stream used to exceed 100 ms cumulative drift.
+            # Complete an inference every 375/450 ms, using its original snapshot.
+            for step in range(1, 121):
+                now[0] = 100 + step * 0.025
+                if step % inference_cycles == 0:
+                    result = InferenceResult(
+                        InferenceRequest(snapshot, "off"), rows, inference_cycles * 25, 0, {}
+                    )
+                    server._admit_inference_result(session, result)
+                response = _step(server, session_id)
+                assert "error" not in response
+                # Either neighbor is valid at a floating-point half-tick boundary.
+                assert abs(response["timestep"] - step * 1.25) <= 0.5 + 1e-9
+                assert response["monitoring_timestep"] == step
+                if response["action"] is not None:
+                    actions += 1
+                    source = response["monitoring"]["emitted_action"]["contributions"][0]
+                    assert source["model_row"] == response["timestep"] - source["source_tick"] + 2
+                    assert now[0] <= source["received_at_s"] + (source["model_row"] - 2) / 50 + 0.04
+                if step % inference_cycles == 0:
+                    snapshot = ObservationSnapshot(
+                        {}, {}, TASK_UUID, TASK_TEXT, session.timestep, session.generation, now[0]
+                    )
+            assert actions > 50
+        finally:
+            await server.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_command_gap_budget_does_not_extend_action_deadlines_and_logs_once(caplog):
+    from gr00t.policy.industrialnext.execution import Contribution, ExecutionSlot, freeze_action
+
+    async def scenario():
+        server = _server(
+            _FakePolicy(),
+            control_clock_mode="elapsed_time",
+            max_action_lateness_s=0.04,
+            max_command_gap_s=0.2,
+            max_control_clock_drift_s=0.1,
+        )
+        now = [100.0]
+        server.clock = lambda: now[0]
+        try:
+            session_id = _register(server)
+            _step(server, session_id)
+            session = server._active_session
+            session.last_emitted_at_s = 100.0
+            row = freeze_action(server.profile.map_action_chunk(_decoded_action())[0])
+            # A row is expired even though the independently configured gap permits recovery.
+            session.timeline[6] = ExecutionSlot((Contribution(row, 0, 6, 100, 100.10),))
+            now[0] = 100.12
+            response = _step(server, session_id)
+            assert "error" not in response
+            assert response["action"] is None
+            assert response["monitoring"]["command_gap_s"] == pytest.approx(0.12)
+            session.timeline[7] = ExecutionSlot((Contribution(row, 6, 1, 100.12, 100.18),))
+            now[0] = 100.14
+            assert _step(server, session_id)["action"] is not None
+            now[0] = 100.35
+            response = _step(server, session_id)
+            assert response["error"] == "session_unusable"
+            assert response["reason"] == "command_gap_expired"
+            assert _step(server, session_id)["reason"] == "command_gap_expired"
+            messages = [
+                r.message for r in caplog.records if "GR00T session terminated" in r.message
+            ]
+            assert len(messages) == 1
+            assert "reason=command_gap_expired" in messages[0]
+            assert "command_gap_limit_s=0.200" in messages[0]
+        finally:
+            await server.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_elapsed_clock_still_rejects_requests_running_too_fast():
+    async def scenario():
+        server = _server(
+            _FakePolicy(), control_clock_mode="elapsed_time", max_control_clock_drift_s=0.1
+        )
+        server.clock = lambda: 100.0
+        try:
+            session_id = _register(server)
+            for _ in range(7):
+                response = _step(server, session_id)
+            assert response["error"] == "session_unusable"
+            assert "control_clock_drift" in response["reason"]
+        finally:
+            await server.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_rotation_mean_and_transition_use_so3_not_six_coordinate_averaging():
     from gr00t.policy.industrialnext.execution import (
         blend_actions,

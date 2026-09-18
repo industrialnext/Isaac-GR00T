@@ -205,27 +205,45 @@ smoothing, not DEFT's startup/human-handover ramp. No output EMA is applied.
 disables transition smoothing independently. Profile values use the corresponding
 `serving` keys; CLI values take precedence. Old profiles omit these keys and receive
 the new ensemble/smoothing defaults, while their execution offset stays 0. The Taro
-launch below explicitly selects offset 2 without changing frozen training YAML.
+experiment profiles explicitly set offset 2 and the ensemble settings.
 
 One inference worker and one replaceable pending observation keep work bounded.
-Expiry occurs before admission and emission. Image freshness uses both accepted ticks
+Expiry occurs before admission and emission. Image freshness uses both execution ticks
 and server-monotonic receipt time (five steps / 0.1 s by default); zero permitted reuse
 requires a same-tick image and allows receipt within one control period. This is not a
 sensor capture-time guarantee. Each contribution expires at its mapped due time plus
 `--max-action-lateness-s` (0.04 s). Transition anchors inherit the earliest source
 deadline; they cannot keep expired predictions executable.
 
-Pace requests at 50 Hz. `--max-control-clock-drift-s` defaults to 0.1 s relative to the
-first valid request; exceeding it ends the session instead of renumbering ticks.
-These timing values are engineering defaults requiring deployment jitter measurement.
-A temporary null can hold the prior ROS command; after emission begins, a command gap
-beyond the next expected period plus the lateness allowance becomes terminal.
+Pace requests at 50 Hz. `serving.control_clock_mode` / `--control-clock-mode` selects
+`accepted_requests` (the backward-compatible default) or `elapsed_time` (Taro experiments).
+The former counts each accepted request; the latter advances to the nearest elapsed
+50 Hz slot when cycles are missed, discarding skipped slots. It never rewinds or emits
+a burst of catch-up actions. `--max-control-clock-drift-s` defaults to 0.1 s; it bounds
+the difference between execution ticks and elapsed time, including requests arriving
+too quickly. The independent monitoring sequence still increments once per request.
+
+`serving.max_command_gap_s` / `--max-command-gap-s` bounds time since the last emitted
+action. Taro uses 0.2 s to allow recovery from brief queue underruns. During a gap the
+server returns null actions and monitoring; the ROS client may hold its last command.
+This does not extend individual action deadlines (still 0.04 s late), change image
+freshness, or override hardware watchdogs. Omitted command-gap settings retain the
+legacy one-period-plus-lateness limit (0.06 s). These are engineering settings requiring
+live latency/jitter validation, not guarantees of rollout success.
+
+The launcher reads these settings from the selected profile and forwards CLI overrides:
+
+```bash
+./inx_serve.sh 100
+./inx_serve.sh full --max-command-gap-s 0.2 --stats-log-interval-steps 50
+```
 
 Irrecoverable failures return `error: "session_unusable"`, a bounded `reason`, and no
-action. The paired ROS client stops the matching run under its run-generation lock,
-clears held commands/slowdown state and retires the connection. A delayed old-run error
-cannot stop a new run. Explicit operator new-run recovery is required; this error does
-not trigger automatic re-registration. Transport loss is a separate client lifecycle.
+action. The server logs the first terminal reason with session, queue, inference latency,
+and command-gap context before clearing the queue. Clients should report that reason
+and stop the matching run rather than retrying the terminal session. The current local
+ROS client logs only the error code and can subsequently report a monitoring timeout;
+this server change does not update that client. Explicit new-session recovery is required.
 
 Monitoring separates raw-chunk dynamics from actual emitted seam/dynamics, and includes
 contributor source ticks, original rows, weights, transition anchors, image ages,

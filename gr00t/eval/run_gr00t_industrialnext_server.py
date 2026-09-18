@@ -50,8 +50,10 @@ class ServerConfig:
     ensemble_coeff: float | None = None
     max_ensemble_chunks: int | None = None
     chunk_transition_frames: int | None = None
-    max_action_lateness_s: float = 0.04
-    max_control_clock_drift_s: float = 0.1
+    control_clock_mode: str | None = None
+    max_action_lateness_s: float | None = None
+    max_control_clock_drift_s: float | None = None
+    max_command_gap_s: float | None = None
     max_image_staleness_steps: int = 5
     min_usable_action_steps: int = 1
     idle_session_timeout_s: float = 300.0
@@ -121,8 +123,18 @@ def resolve_server_config(
         chunk_transition_frames=profile.chunk_transition_frames
         if config.chunk_transition_frames is None
         else config.chunk_transition_frames,
-        max_action_lateness_s=config.max_action_lateness_s,
-        max_control_clock_drift_s=config.max_control_clock_drift_s,
+        control_clock_mode=profile.control_clock_mode
+        if config.control_clock_mode is None
+        else config.control_clock_mode,
+        max_action_lateness_s=profile.max_action_lateness_s
+        if config.max_action_lateness_s is None
+        else config.max_action_lateness_s,
+        max_control_clock_drift_s=profile.max_control_clock_drift_s
+        if config.max_control_clock_drift_s is None
+        else config.max_control_clock_drift_s,
+        max_command_gap_s=profile.max_command_gap_s
+        if config.max_command_gap_s is None
+        else config.max_command_gap_s,
         max_image_staleness_steps=config.max_image_staleness_steps,
         min_usable_action_steps=config.min_usable_action_steps,
         idle_session_timeout_s=config.idle_session_timeout_s,

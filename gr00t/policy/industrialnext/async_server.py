@@ -144,6 +144,8 @@ class IndustrialNextServingConfig:
     chunk_transition_frames: int = 4
     max_action_lateness_s: float = 0.04
     max_control_clock_drift_s: float = 0.1
+    control_clock_mode: str = "accepted_requests"
+    max_command_gap_s: float | None = None
     rtc_mode: str = "off"
     rtc_initial_frozen_steps: int = 1
     rtc_delay_window_size: int = 20
@@ -162,6 +164,14 @@ class IndustrialNextServingConfig:
     max_gripper_second_difference: float | None = None
 
     def __post_init__(self) -> None:
+        if self.control_clock_mode not in {"accepted_requests", "elapsed_time"}:
+            raise ValueError("control_clock_mode must be accepted_requests or elapsed_time")
+        if self.max_command_gap_s is not None and (
+            isinstance(self.max_command_gap_s, bool)
+            or not math.isfinite(self.max_command_gap_s)
+            or self.max_command_gap_s <= 0
+        ):
+            raise ValueError("max_command_gap_s must be finite and positive")
         if not math.isfinite(self.control_hz) or self.control_hz != 50.0:
             raise ValueError("control_hz must be exactly 50.0")
         if (
@@ -527,9 +537,10 @@ class IndustrialNextAsyncServer:
                 "output_hz": self.config.control_hz,
                 "speed_factor": 1.0,
                 "timestamp_clock": "server_monotonic",
-                "tick_clock": "accepted_requests",
+                "tick_clock": self.config.control_clock_mode,
                 "max_action_lateness_s": self.config.max_action_lateness_s,
                 "max_control_clock_drift_s": self.config.max_control_clock_drift_s,
+                "max_command_gap_s": self._command_gap_limit_s,
             },
             "default_ensemble": {
                 "strategy": self.config.ensemble_strategy,
@@ -647,6 +658,11 @@ class IndustrialNextAsyncServer:
         if session.requires_reregistration:
             return self._terminal_response(session)
         candidate_timestep = session.timestep + 1
+        now_s = self.clock()
+        if self.config.control_clock_mode == "elapsed_time" and session.epoch_time_s is not None:
+            # Advance past missed control slots rather than stretching old predictions.
+            elapsed_tick = int((now_s - session.epoch_time_s) * self.config.control_hz + 0.5)
+            candidate_timestep = max(candidate_timestep, elapsed_tick)
         observation = request.get("observation")
         if not isinstance(observation, Mapping):
             raise ValueError("observation must be a mapping")
@@ -658,10 +674,9 @@ class IndustrialNextAsyncServer:
             task_text=session.task_text,
             generation=session.generation,
             max_image_staleness_steps=self.config.max_image_staleness_steps,
-            now_s=self.clock(),
+            now_s=now_s,
         )
 
-        now_s = self.clock()
         if session.epoch_time_s is None:
             session.epoch_time_s = now_s
         drift_s = now_s - session.epoch_time_s - candidate_timestep / self.config.control_hz
@@ -760,13 +775,16 @@ class IndustrialNextAsyncServer:
             else:
                 session.timeline[tick] = live
 
+    @property
+    def _command_gap_limit_s(self) -> float:
+        if self.config.max_command_gap_s is not None:
+            return self.config.max_command_gap_s
+        return 1 / self.config.control_hz + self.config.max_action_lateness_s
+
     def _command_gap_expired(self, session: ActiveSession, now_s: float) -> bool:
         return (
             session.last_emitted_at_s is not None
-            and now_s
-            > session.last_emitted_at_s
-            + 1 / self.config.control_hz
-            + self.config.max_action_lateness_s
+            and now_s > session.last_emitted_at_s + self._command_gap_limit_s
         )
 
     def _dynamics_exceeded(self, dynamics: tuple[float, ...]) -> bool:
@@ -782,6 +800,22 @@ class IndustrialNextAsyncServer:
     def _terminate(self, session: ActiveSession, reason: str) -> None:
         if session.terminal_reason is None:
             session.terminal_reason = reason[:512]
+            logger.error(
+                "GR00T session terminated session=%s step=%d reason=%s queue=%d "
+                "inference_ms=%.1f source_to_result_ms=%.1f command_gap_s=%s "
+                "command_gap_limit_s=%.3f clock_mode=%s",
+                session.session_id,
+                session.timestep,
+                session.terminal_reason,
+                len(session.timeline),
+                session.inference_latency_ms,
+                session.source_to_result_latency_ms,
+                None
+                if session.last_emitted_at_s is None
+                else self.clock() - session.last_emitted_at_s,
+                self._command_gap_limit_s,
+                self.config.control_clock_mode,
+            )
         session.requires_reregistration = True
         session.inference_status = "session_unusable"
         session.timeline.clear()
@@ -1275,6 +1309,12 @@ class IndustrialNextAsyncServer:
             (session.timestep - source["source_tick"] for source in sources), default=None
         )
         monitoring = {
+            "command_gap_s": None
+            if session.last_emitted_at_s is None
+            else now_s - session.last_emitted_at_s,
+            "control_clock_drift_s": None
+            if session.epoch_time_s is None
+            else now_s - session.epoch_time_s - session.timestep / self.config.control_hz,
             "source_to_result_latency_ms": session.source_to_result_latency_ms,
             "action_source_age_s": [now_s - source["received_at_s"] for source in sources],
             "emitted_action": session.latest_emitted_provenance,
@@ -1364,7 +1404,7 @@ class IndustrialNextAsyncServer:
 
     def _maybe_log_stats(self, session: ActiveSession, *, server_step_ms: float) -> None:
         interval = self.config.stats_log_interval_steps
-        if interval <= 0 or (session.timestep + 1) % interval != 0:
+        if interval <= 0 or (session.monitoring_timestep + 1) % interval != 0:
             return
         logger.info(
             "GR00T async stats session=%s step=%d server_step_ms=%.3f "

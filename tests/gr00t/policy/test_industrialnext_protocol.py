@@ -9,7 +9,9 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
+import subprocess
 import threading
 import time
 from typing import Any
@@ -33,6 +35,7 @@ from industrialnext_rpc.direct.client import DirectClient
 from industrialnext_rpc.direct.server import DirectServer
 import numpy as np
 import pytest
+import tyro
 import yaml
 
 
@@ -318,6 +321,43 @@ def test_config_only_cli_defaults_and_overrides(tmp_path: Path) -> None:
     }
 
 
+@pytest.mark.parametrize("variant", ["100", "full"])
+def test_inx_launcher_resolves_timing_recipe_and_overrides(tmp_path, variant):
+    # Capture the actual shell arguments without loading a model or binding a socket.
+    shim = tmp_path / "uv"
+    shim.write_text('#!/bin/bash\nprintf "%s\\0" "$@"\n')
+    shim.chmod(0o755)
+    for overrides, gap in [([], 0.2), (["--max-command-gap-s", "0.3"], 0.3)]:
+        argv = (
+            subprocess.check_output(
+                ["bash", "inx_serve.sh", variant, "--model-path", str(tmp_path), *overrides],
+                env={**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"]},
+            )
+            .decode()
+            .split("\0")[:-1]
+        )
+        args = argv[argv.index("gr00t/eval/run_gr00t_industrialnext_server.py") + 1 :]
+        resolved, profile = resolve_server_config(tyro.cli(ServerConfig, args=args))
+        assert profile.name == f"taro_exp_{variant}"
+        assert resolved.serving.action_offset == 2
+        assert resolved.serving.control_clock_mode == "elapsed_time"
+        assert resolved.serving.max_action_lateness_s == 0.04
+        assert resolved.serving.max_control_clock_drift_s == 0.1
+        assert resolved.serving.max_command_gap_s == gap
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            server = IndustrialNextAsyncServer(
+                policy=_BlockingPolicy(),
+                executor=executor,
+                config=resolved.serving,
+                service_provenance={},
+                embodiment_tag=resolved.embodiment_tag,
+                profile=profile,
+            )
+            metadata = server._service_metadata()["execution"]
+            assert metadata["tick_clock"] == "elapsed_time"
+            assert metadata["max_command_gap_s"] == gap
+
+
 def test_serving_recipe_precedence_and_absolute_metadata(tmp_path):
     document = yaml.safe_load(Path("configs/embodiments/taro_exp_100.yaml").read_text())
     document["serving"].update(
@@ -326,17 +366,25 @@ def test_serving_recipe_precedence_and_absolute_metadata(tmp_path):
         ensemble_coeff=0.2,
         max_ensemble_chunks=2,
         chunk_transition_frames=3,
+        control_clock_mode="elapsed_time",
+        max_action_lateness_s=0.05,
+        max_control_clock_drift_s=0.15,
+        max_command_gap_s=0.2,
     )
     path = tmp_path / "profile.yaml"
     path.write_text(yaml.safe_dump(document))
     resolved, profile = resolve_server_config(
-        ServerConfig(config=str(path), action_offset=2, ensemble_coeff=0.3)
+        ServerConfig(config=str(path), action_offset=2, ensemble_coeff=0.3, max_command_gap_s=0.3)
     )
     assert resolved.serving.action_offset == 2
     assert profile.action_start_offset_steps == 0
     assert resolved.serving.ensemble_coeff == 0.3
     assert resolved.serving.max_ensemble_chunks == 2
     assert resolved.serving.chunk_transition_frames == 3
+    assert resolved.serving.control_clock_mode == "elapsed_time"
+    assert resolved.serving.max_action_lateness_s == 0.05
+    assert resolved.serving.max_control_clock_drift_s == 0.15
+    assert resolved.serving.max_command_gap_s == 0.3
     metadata = profile.service_metadata()
     assert metadata["state_dim"] == 38
     assert metadata["action_dim"] == 29
@@ -359,6 +407,10 @@ def test_serving_recipe_precedence_and_absolute_metadata(tmp_path):
         {"max_ensemble_chunks": 0},
         {"max_action_lateness_s": 0},
         {"max_control_clock_drift_s": float("inf")},
+        {"max_command_gap_s": 0},
+        {"max_command_gap_s": True},
+        {"max_command_gap_s": float("nan")},
+        {"control_clock_mode": "unknown"},
     ],
 )
 def test_invalid_serving_recipe_fails_before_model_loading(settings):

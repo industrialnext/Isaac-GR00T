@@ -81,6 +81,10 @@ class ConfigDrivenIndustrialNextProfile:
     ensemble_coeff: float = 0.1
     max_ensemble_chunks: int = 3
     chunk_transition_frames: int = 4
+    control_clock_mode: str = "accepted_requests"
+    max_action_lateness_s: float = 0.04
+    max_control_clock_drift_s: float = 0.1
+    max_command_gap_s: float | None = None
 
     @property
     def state_fields(self) -> tuple[str, ...]:
@@ -424,6 +428,10 @@ def load_industrialnext_profile(path: str | Path) -> ConfigDrivenIndustrialNextP
         "ensemble_coeff",
         "max_ensemble_chunks",
         "chunk_transition_frames",
+        "control_clock_mode",
+        "max_action_lateness_s",
+        "max_control_clock_drift_s",
+        "max_command_gap_s",
         "profile",
         "embodiment_tag",
         "model_path",
@@ -578,6 +586,10 @@ def load_industrialnext_profile(path: str | Path) -> ConfigDrivenIndustrialNextP
         ensemble_coeff=serving.get("ensemble_coeff", 0.1),
         max_ensemble_chunks=serving.get("max_ensemble_chunks", 3),
         chunk_transition_frames=serving.get("chunk_transition_frames", 4),
+        control_clock_mode=serving.get("control_clock_mode", "accepted_requests"),
+        max_action_lateness_s=serving.get("max_action_lateness_s", 0.04),
+        max_control_clock_drift_s=serving.get("max_control_clock_drift_s", 0.1),
+        max_command_gap_s=serving.get("max_command_gap_s"),
         name=_string(raw.get("name"), "name"),
         profile_name=_string(serving.get("profile"), "serving.profile"),
         config_path=config_path,

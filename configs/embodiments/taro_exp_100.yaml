@@ -89,6 +89,17 @@ serving:
   image_size: [256, 256]
   rtc_mode: "off"
   supported_rtc_modes: ["off"]
+  action_offset: 2  # Skip native prediction rows; command cadence remains 50 Hz.
+  # Ensemble settings match industrialnext_ai/config/manipulation/semihumanoid/taro_exps/_serving.yaml.
+  ensemble_strategy: temporal_exponential
+  ensemble_coeff: 0.1
+  max_ensemble_chunks: 3
+  chunk_transition_frames: 4
+  # Skip missed 50 Hz slots; tolerate brief underruns without extending action deadlines.
+  control_clock_mode: elapsed_time
+  max_action_lateness_s: 0.04
+  max_control_clock_drift_s: 0.1
+  max_command_gap_s: 0.2
   cameras:
     head: head_rgb
     left_wrist: eoat_left_top_fisheye_rgb
